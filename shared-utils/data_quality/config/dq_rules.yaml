@@ -1,0 +1,90 @@
+# ============================================================
+# Multi-Table Data Quality Configuration
+# ============================================================
+
+tables:
+
+  sales_orders:
+    table_name: catalog.schema.sales_orders
+
+    volume:
+      warn_pct: 20
+      fail_pct: 40
+
+    schema:
+      expected:
+        order_id: bigint
+        amount: double
+        email: string
+        status: string
+
+    rules:
+      - name: order_id_not_null
+        type: not_null
+        column: order_id
+        severity: CRITICAL
+        weight: 5
+
+      - name: amount_range
+        type: range
+        column: amount
+        min: 0
+        max: 100000
+        severity: HIGH
+        weight: 3
+
+      - name: email_semantic
+        type: llm_semantic
+        column: email
+        description: "valid business email addresses"
+        severity: HIGH
+        weight: 3
+
+
+  customers:
+    table_name: catalog.schema.customers
+
+    volume:
+      warn_pct: 15
+      fail_pct: 30
+
+    schema:
+      expected:
+        customer_id: bigint
+        name: string
+        phone: string
+
+    rules:
+      - name: customer_id_not_null
+        type: not_null
+        column: customer_id
+        severity: CRITICAL
+        weight: 5
+
+      - name: phone_semantic
+        type: llm_semantic
+        column: phone
+        description: "valid phone numbers without country code"
+        severity: MEDIUM
+        weight: 2
+
+
+# ------------------------------------------------------------
+# CROSS TABLE RULES
+# ------------------------------------------------------------
+cross_table_rules:
+
+  - name: orders_customer_fk
+    type: foreign_key
+    severity: CRITICAL
+    weight: 5
+
+    source:
+      table: sales_orders
+      column: customer_id
+
+    target:
+      table: customers
+      column: customer_id
+
+    allow_nulls: false

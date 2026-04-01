@@ -1,0 +1,62 @@
+# Data Generator Configuration
+# Matches the existing output in ./output/
+# Usage: gen.generate_from_config('/Workspace/data_generator/config/config_simple.yaml')
+
+output_path: ./output
+output_format: csv,json
+
+tables:
+  # ─── Users Table ───────────────────────────────────────────────────────
+  - table_name: users
+    rows_count: 20
+    columns:
+      - name: user_id
+        type: integer
+        range: [100, 999]
+        unique: true
+
+      - name: username
+        type: string
+        length: 8
+        prefix: "user_"
+        unique: true
+
+      - name: email
+        type: email
+        domains: ["example.com", "test.com"]
+        unique: true
+
+      - name: age
+        type: integer
+        range: [18, 65]
+
+      - name: is_active
+        type: boolean
+        true_probability: 0.85
+
+  # ─── Orders Table (references users) ───────────────────────────────────
+  - table_name: orders
+    rows_count: 100
+    columns:
+      - name: order_id
+        type: uuid
+
+      - name: user_id
+        type: reference
+        ref_table: users
+        ref_column: user_id
+
+      - name: amount
+        type: float
+        range: [10.0, 999.99]
+        decimals: 2
+
+      - name: status
+        type: choice
+        values: ["pending", "completed", "cancelled"]
+        weights: [20, 65, 15]
+
+      - name: order_date
+        type: date
+        format: "%Y-%m-%d"
+        range: ["2024-01-01", "2024-12-31"]
