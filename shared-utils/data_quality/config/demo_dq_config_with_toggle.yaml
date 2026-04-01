@@ -1,0 +1,224 @@
+# ============================================================
+# Demo Data Quality Configuration with Enable/Disable Toggle
+# ============================================================
+# Simply set "enabled: false" to disable any check
+# Default is "enabled: true" if not specified
+
+tables:
+
+  users:
+    table_name: default.users
+    
+    volume:
+      warn_pct: 20
+      fail_pct: 40
+    
+    schema:
+      expected:
+        user_id: bigint
+        name: string
+        email: string
+        age: bigint
+        created_date: string
+    
+    rules:
+      # NOT NULL checks
+      - name: user_id_not_null
+        type: not_null
+        column: user_id
+        severity: CRITICAL
+        weight: 10
+        enabled: true  # ✅ This check will run
+      
+      - name: email_not_null
+        type: not_null
+        column: email
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+      
+      # UNIQUE checks
+      - name: user_id_unique
+        type: unique
+        column: user_id
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+      
+      - name: email_unique
+        type: unique
+        column: email
+        severity: HIGH
+        weight: 8
+        enabled: true
+      
+      # RANGE checks
+      - name: age_range_check
+        type: range
+        column: age
+        min: 18
+        max: 100
+        severity: HIGH
+        weight: 5
+        enabled: true
+      
+      # PATTERN checks
+      - name: email_pattern_check
+        type: pattern
+        column: email
+        pattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$'
+        severity: HIGH
+        weight: 7
+        enabled: true
+      
+      # COMPLETENESS checks
+      - name: name_completeness
+        type: completeness
+        column: name
+        min_completeness_pct: 95
+        severity: MEDIUM
+        weight: 5
+        enabled: true
+      
+      # STRING LENGTH checks
+      - name: name_length_check
+        type: string_length
+        column: name
+        min_length: 2
+        max_length: 100
+        severity: LOW
+        weight: 3
+        enabled: false  # ❌ This check will be SKIPPED
+      
+      # LLM SEMANTIC checks (expensive - disabled by default)
+      - name: email_semantic_validation
+        type: llm_semantic
+        column: email
+        description: "valid professional email addresses"
+        model: meta.llama-3.1-70b-instruct
+        sample_size: 30
+        severity: MEDIUM
+        weight: 5
+        enabled: false  # ❌ Disabled - costs money!
+
+
+  orders:
+    table_name: default.orders
+    
+    volume:
+      warn_pct: 25
+      fail_pct: 50
+    
+    schema:
+      expected:
+        order_id: bigint
+        user_id: bigint
+        product: string
+        amount: double
+        status: string
+        order_date: string
+    
+    rules:
+      # NOT NULL checks
+      - name: order_id_not_null
+        type: not_null
+        column: order_id
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+      
+      - name: user_id_not_null
+        type: not_null
+        column: user_id
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+      
+      # UNIQUE checks
+      - name: order_id_unique
+        type: unique
+        column: order_id
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+      
+      # RANGE checks
+      - name: amount_range_check
+        type: range
+        column: amount
+        min: 0
+        max: 10000
+        severity: HIGH
+        weight: 8
+        enabled: true
+      
+      # VALUE SET checks
+      - name: status_value_check
+        type: value_set
+        column: status
+        allowed_values: ['pending', 'completed', 'cancelled', 'shipped', 'delivered']
+        severity: HIGH
+        weight: 7
+        enabled: true
+      
+      # COMPLETENESS checks
+      - name: product_completeness
+        type: completeness
+        column: product
+        min_completeness_pct: 100
+        severity: HIGH
+        weight: 6
+        enabled: true
+      
+      # DUPLICATE checks
+      - name: no_duplicate_orders
+        type: duplicate
+        column: order_id
+        max_duplicates: 0
+        severity: CRITICAL
+        weight: 10
+        enabled: true
+
+
+# ------------------------------------------------------------
+# CROSS TABLE RULES
+# ------------------------------------------------------------
+cross_table_rules:
+
+  - name: orders_user_foreign_key
+    type: foreign_key
+    severity: CRITICAL
+    weight: 10
+    enabled: true  # ✅ Foreign key check enabled
+    
+    source:
+      table: orders
+      column: user_id
+    
+    target:
+      table: users
+      column: user_id
+    
+    allow_nulls: false
+
+
+# ============================================================
+# QUICK ENABLE/DISABLE EXAMPLES
+# ============================================================
+#
+# To disable a check, just set enabled: false
+#
+# Example: Disable expensive LLM checks
+#   - name: llm_check
+#     enabled: false
+#
+# Example: Disable all checks for a table during maintenance
+#   users:
+#     enabled: false  # Skips entire table
+#
+# Example: Temporarily disable cross-table checks
+#   cross_table_rules:
+#     - name: fk_check
+#       enabled: false
+#
+# ============================================================
