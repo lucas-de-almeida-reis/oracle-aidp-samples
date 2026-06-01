@@ -147,6 +147,22 @@ RULE_DISCOVER_FIRST = (
     "(e.g. list tables, describe columns) and base the real query "
     "on the result. Do NOT guess."
 )
+RULE_TOOL_BEFORE_EXPLAIN = (
+    "  - For ANY data question — simple or complex — your FIRST "
+    "action is to call the tool. Do NOT narrate your plan in text "
+    "before calling. Do NOT write 'I'll do X, then Y, then Z' and "
+    "stop there. Call the tool first, then summarize what it "
+    "returned. If a question requires multiple tool calls, just "
+    "make them sequentially — don't pre-announce the plan."
+)
+RULE_VERIFY_OWN_CLAIMS = (
+    "  - NEVER rely on your memory of prior schema statements. If "
+    "you said earlier that a column or table doesn't exist and the "
+    "user now references it, run a fresh discovery call BEFORE "
+    "responding. Your prior statement may have been wrong, and the "
+    "user knowing the schema is more reliable evidence than your "
+    "earlier guess. Verify, then act."
+)
 RULE_PRESERVE_INTENT = (
     "  - Preserve the user's intent. You MAY enrich the question "
     "with fully-qualified table names or filter clarifications when "
@@ -329,6 +345,8 @@ def _build_system_prompt() -> str:
     parts.append(RULE_ANTI_REFUSAL)
     parts.append(RULE_RETRY_ON_BAD_RESULT)
     parts.append(RULE_DISCOVER_FIRST)
+    parts.append(RULE_TOOL_BEFORE_EXPLAIN)
+    parts.append(RULE_VERIFY_OWN_CLAIMS)
 
     # Per-integration rules
     if ADB_ENABLED:
@@ -729,12 +747,37 @@ class AgentBasic:
         self._last_trim_msg_tokens_est: int = 0
         self._last_trim_status: str = "n/a"
 
+        # Last pre_model_hook activity. The hook runs INSIDE the graph
+        # before every LLM call and filters out orphan tool_call /
+        # ToolMessage pairs that providers (OCI generic / OpenAI /
+        # Anthropic) silently choke on — the leading suspect for
+        # cross-model refusal cascades per langgraph forum #1873.
+        # Always-on (no opt-in flag); only structural-cleanup when
+        # max_context_tokens=0, also budget-caps when > 0.
+        self._last_pre_hook_status: str = "n/a"
+
         # Sanitized snapshot of the langgraph config passed to ainvoke this
         # turn. Used by the debug block to confirm whether AIDP's
         # pre_invoke_setup() injected a `configurable.thread_id` — without
         # that key langgraph's checkpointer silently bypasses state, which
         # breaks trim, orphan healing, and persistent conversation memory.
         self._last_config_keys: str = ""
+
+        # ── Deep introspection snapshots ────────────────────────────
+        # Populated each turn so the DEBUG block can prove *exactly*
+        # what the LLM saw. When the model refuses tool calls, these
+        # let an operator verify the inputs were correct.
+        self._last_tool_descriptions: list[str] = []   # "name — first 100 chars of description"
+        self._last_state_breakdown: str = ""          # "human=N ai=N tool=N tool_errors=N orphan_tc=N"
+        self._last_kwargs_keys: str = ""              # what AIDP passed in **kwargs
+        self._last_user_msg_preview: str = ""         # this turn's user input (truncated)
+        self._last_state_tail: str = ""               # last AIMessage excerpt from state
+
+        # Last hard-clear strategy used. Set by _hard_clear_history to
+        # one of "batch RemoveMessage" / "one-at-a-time" / "adelete_thread"
+        # so the /reset chat response can report which path actually
+        # worked (logs aren't always accessible to the operator).
+        self._last_clear_strategy: str = ""
 
     # ── Setup (sync) ────────────────────────────────────────────
     def setup(self) -> None:
@@ -780,6 +823,7 @@ class AgentBasic:
         self.llm = init_oci_llm(llm_conf)
         self.graph = create_react_agent(
             self.llm, [], prompt=AGENT_SYSTEM_PROMPT, checkpointer=checkpointer,
+            pre_model_hook=self._pre_model_hook,
         )
         logger.info("Stub graph ready; will load MCP tools on first invoke")
 
@@ -809,15 +853,19 @@ class AgentBasic:
 
         self._last_tool_names = [t.name for t in tools]
 
-        # Estimate token cost of tool definitions for the trim budget.
-        # Char/4 is a conservative English-text heuristic; the +40 fudge
-        # per tool accounts for the JSON-schema params block.
+        # Estimate token cost of tool definitions for the trim budget AND
+        # capture name + first 120 chars of description per tool so the
+        # DEBUG block can prove exactly what the LLM is seeing.
         estimate = 0
+        descs: list[str] = []
         for t in tools:
             name = getattr(t, "name", "") or ""
             desc = getattr(t, "description", "") or ""
             estimate += (len(name) + len(desc)) // 4 + 40
+            desc_excerpt = desc.replace("\n", " ").strip()[:120]
+            descs.append(f"{name} — {desc_excerpt}" if desc_excerpt else name)
         self._tools_token_estimate = estimate
+        self._last_tool_descriptions = descs
 
         logger.info(
             "Loaded %d tool(s) from %d MCP server(s) [ephemeral sessions]: %s "
@@ -825,10 +873,11 @@ class AgentBasic:
             len(tools), len(cfg), self._last_tool_names, self._tools_token_estimate,
         )
         # Re-create the LangGraph react agent with the freshly loaded
-        # tools. The system prompt and checkpointer carry over so chat
-        # state isn't lost when we rebuild.
+        # tools. The system prompt, checkpointer, and pre_model_hook
+        # carry over so chat state isn't lost when we rebuild.
         self.graph = create_react_agent(
             self.llm, tools, prompt=AGENT_SYSTEM_PROMPT, checkpointer=checkpointer,
+            pre_model_hook=self._pre_model_hook,
         )
         self._tools_loaded = True
         self._mcp_built_epoch = time.time()
@@ -943,6 +992,60 @@ class AgentBasic:
                 # during the rebuild.
                 await self._load_all_mcp_tools()
 
+    # ── Message-shape adapters ──────────────────────────────────
+    #
+    # AIDP's checkpointer serializes messages to plain dicts on the way
+    # into state. They come back from aget_state() as dicts too — NOT
+    # as HumanMessage / AIMessage / ToolMessage objects. So every piece
+    # of state-touching code (orphan heal, hard clear, trim, debug)
+    # must read attributes via dict keys instead of `.id` / `.tool_calls`
+    # etc. These helpers normalize both forms.
+    #
+    # Without this, _hard_clear_history found zero removable IDs (all
+    # 51 messages had no `.id` attribute → empty RemoveMessage list →
+    # aupdate_state was a no-op → /reset silently did nothing).
+
+    @staticmethod
+    def _msg_get(msg, key, default=None):
+        """Return msg[key] for dicts, msg.key for objects, default otherwise."""
+        if isinstance(msg, dict):
+            return msg.get(key, default)
+        return getattr(msg, key, default)
+
+    @classmethod
+    def _msg_id(cls, msg):
+        return cls._msg_get(msg, "id")
+
+    @classmethod
+    def _msg_tool_calls(cls, msg):
+        """List of {id, name, args} dicts, or empty list."""
+        tcs = cls._msg_get(msg, "tool_calls", None)
+        if tcs is None:
+            # OpenAI/Cohere-style serializations sometimes nest tool_calls
+            # under additional_kwargs.tool_calls. Fall back to that.
+            kwargs = cls._msg_get(msg, "additional_kwargs", None) or {}
+            tcs = kwargs.get("tool_calls") if isinstance(kwargs, dict) else None
+        return tcs or []
+
+    @classmethod
+    def _msg_tool_call_id(cls, msg):
+        return cls._msg_get(msg, "tool_call_id")
+
+    @classmethod
+    def _msg_type(cls, msg):
+        """Return a friendly type label, even when the message is a dict.
+        Dicts carry the real type in a 'type' field ('human', 'ai',
+        'tool', 'system'); objects use class name."""
+        if isinstance(msg, dict):
+            t = msg.get("type") or msg.get("role")
+            return t or "dict"
+        return type(msg).__name__
+
+    @classmethod
+    def _msg_content(cls, msg):
+        c = cls._msg_get(msg, "content", "")
+        return c if isinstance(c, str) else ""
+
     @staticmethod
     def _state_config(config):
         """Return a copy of `config` that's safe for graph state-reading
@@ -1008,11 +1111,11 @@ class AgentBasic:
 
         expected, fulfilled = set(), set()
         for msg in messages:
-            for tc in getattr(msg, "tool_calls", None) or []:
+            for tc in self._msg_tool_calls(msg):
                 tcid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
                 if tcid:
                     expected.add(tcid)
-            tcid = getattr(msg, "tool_call_id", None)
+            tcid = self._msg_tool_call_id(msg)
             if tcid:
                 fulfilled.add(tcid)
 
@@ -1028,12 +1131,12 @@ class AgentBasic:
         removals = []
         for msg in messages:
             msg_tc_ids = set()
-            for tc in getattr(msg, "tool_calls", None) or []:
+            for tc in self._msg_tool_calls(msg):
                 tcid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
                 if tcid:
                     msg_tc_ids.add(tcid)
             if msg_tc_ids & orphans:
-                msg_id = getattr(msg, "id", None)
+                msg_id = self._msg_id(msg)
                 if msg_id:
                     removals.append(RemoveMessage(id=msg_id))
 
@@ -1054,10 +1157,17 @@ class AgentBasic:
 
     async def _hard_clear_history(self, config) -> int:
         """Last-resort recovery: remove EVERY message from conversation state.
-        Used when `_heal_orphan_tool_calls` couldn't fix an INVALID_CHAT_HISTORY
-        situation (typically because some persisted AIMessage has no `.id` for
-        targeted removal). Loses conversation history but the next message
-        starts from a clean slate. Returns the number of messages cleared."""
+
+        Issues one RemoveMessage per stored message via aupdate_state.
+
+        Why one-at-a-time instead of a batched RemoveMessage list: on
+        AIDP's checkpointer, batching > ~50 RemoveMessages in a single
+        aupdate_state call empirically raises IndexError. Going one at
+        a time is ~50 round-trips on a large clear but it always works
+        and per-call latency is sub-millisecond, so even a 100-message
+        wipe finishes well under a second.
+
+        Returns the count actually cleared."""
         if not self.graph or not config:
             return 0
         state_cfg = self._state_config(config)
@@ -1073,19 +1183,120 @@ class AgentBasic:
 
         removals = []
         for msg in messages:
-            msg_id = getattr(msg, "id", None)
+            msg_id = self._msg_id(msg)
             if msg_id:
                 removals.append(RemoveMessage(id=msg_id))
 
         if not removals:
+            logger.warning(
+                "Hard-clear: %d messages in state but NONE had an id field. "
+                "Cannot wipe — AIDP's checkpointer dropped message ids.",
+                len(messages),
+            )
+            self._last_clear_strategy = "no removable ids"
             return 0
 
+        succeeded = 0
+        last_err = ""
+        for r in removals:
+            try:
+                await self.graph.aupdate_state(state_cfg, {"messages": [r]})
+                succeeded += 1
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {str(e)[:120]}"
+
+        if succeeded:
+            self._last_clear_strategy = (
+                f"one-at-a-time ({succeeded}/{len(removals)} removed)"
+            )
+            logger.warning(
+                "Hard-clear: removed %d/%d msg(s) one-at-a-time%s",
+                succeeded, len(removals),
+                f" (last error: {last_err})" if last_err else "",
+            )
+            return succeeded
+
+        self._last_clear_strategy = f"failed (last error: {last_err})"
         logger.warning(
-            "Hard-clearing %d message(s) from conversation state (last-resort recovery)",
-            len(removals),
+            "Hard-clear: all %d removals failed. Last error: %s",
+            len(removals), last_err or "n/a",
         )
-        await self.graph.aupdate_state(state_cfg, {"messages": removals})
-        return len(removals)
+        return 0
+
+    def _pre_model_hook(self, state):
+        """Always-on history hygiene for every LLM call.
+
+        Runs INSIDE the graph immediately before each model invocation
+        (langgraph prebuilt's `pre_model_hook` slot). Returns a filtered
+        message list under `llm_input_messages` — does NOT mutate
+        persistent state, so /reset and the DEBUG block still see the
+        full history.
+
+        Why this exists: create_react_agent passes the entire message
+        history to the LLM every turn with no built-in hygiene. Once
+        history grows and pairs get out of sync, providers (OCI generic,
+        OpenAI, Anthropic) silently fall back to refusal-flavored
+        responses instead of calling tools. The langgraph community's
+        recommended remedy is exactly this:
+            trim_messages(start_on="human", end_on=("human","tool"))
+        applied on every LLM call to guarantee a well-formed
+        sub-sequence reaches the model.
+
+        Token cap behavior:
+            • LLM_MAX_CONTEXT_TOKENS > 0 → cap to
+              max - reserve - system - tools (same formula as the
+              opt-in _trim_history path).
+            • LLM_MAX_CONTEXT_TOKENS == 0 → effectively unlimited
+              (1_000_000 budget). Hook still runs because
+              start_on/end_on do pair-integrity cleanup regardless of
+              budget.
+
+        Sync on purpose: langgraph supports both sync and async hooks,
+        and there's nothing to await here (pure in-memory transform)."""
+        messages = (state or {}).get("messages", []) or []
+
+        if not messages or _lc_trim_messages is None or _lc_count_tokens is None:
+            self._last_pre_hook_status = (
+                f"skipped (in={len(messages)}, helpers="
+                f"{'ok' if _lc_trim_messages else 'missing'})"
+            )
+            return {"llm_input_messages": messages}
+
+        if LLM_MAX_CONTEXT_TOKENS > 0:
+            overhead = (
+                (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
+                + self._tools_token_estimate
+                + LLM_RESPONSE_RESERVE_TOKENS
+            )
+            budget = max(LLM_MAX_CONTEXT_TOKENS - overhead, 1024)
+            mode = f"budget={budget}"
+        else:
+            budget = 1_000_000
+            mode = "structural-only"
+
+        try:
+            kept = _lc_trim_messages(
+                messages,
+                max_tokens=budget,
+                strategy="last",
+                token_counter=_lc_count_tokens,
+                allow_partial=False,
+                start_on="human",
+                end_on=("human", "tool"),
+                include_system=False,
+            )
+        except Exception as e:
+            self._last_pre_hook_status = (
+                f"trim raised {type(e).__name__}: {str(e)[:120]}; "
+                f"passing through {len(messages)} msgs"
+            )
+            return {"llm_input_messages": messages}
+
+        dropped = len(messages) - len(kept)
+        self._last_pre_hook_status = (
+            f"in={len(messages)} out={len(kept)} dropped={dropped} ({mode})"
+        )
+        return {"llm_input_messages": kept}
 
     async def _trim_history(self, config) -> int:
         """Drop oldest conversation turns when the running history would
@@ -1144,6 +1355,40 @@ class AgentBasic:
 
         messages = state.values.get("messages", []) if state and state.values else []
         self._last_trim_msg_count = len(messages)
+
+        # Walk the messages once to build a debug-friendly breakdown:
+        # types (via dict-aware adapter), count of tool-error messages,
+        # last AI message tail, and how many message ids we can target.
+        type_counts: dict[str, int] = {}
+        tool_error_count = 0
+        last_ai_excerpt = ""
+        ids_present = 0
+        for msg in messages:
+            kind = self._msg_type(msg).lower()
+            type_counts[kind] = type_counts.get(kind, 0) + 1
+            if self._msg_id(msg):
+                ids_present += 1
+            # Tool errors — common contaminant of GPT defensive-mode cascades.
+            if kind in ("tool", "toolmessage"):
+                content = self._msg_content(msg).lower()
+                if content and any(
+                    s in content for s in
+                    ("error", "exception", "ora-", "invalid", "fail")
+                ):
+                    tool_error_count += 1
+            if kind in ("ai", "aimessage"):
+                c = self._msg_content(msg).strip()
+                if c:
+                    last_ai_excerpt = c[:160].replace("\n", " ")
+        # Compact summary. ids_present is critical — if it's 0 then
+        # _hard_clear_history / orphan-heal cannot remove anything.
+        self._last_state_breakdown = (
+            " ".join(f"{k}={v}" for k, v in sorted(type_counts.items()))
+            + (f" tool_errors={tool_error_count}" if tool_error_count else "")
+            + f" ids={ids_present}/{len(messages)}"
+        )
+        self._last_state_tail = last_ai_excerpt
+
         if not messages:
             self._last_trim_status = "no messages in state yet"
             return 0
@@ -1461,6 +1706,54 @@ class AgentBasic:
                 f"Runtime diagnostics:\n{self._runtime_diagnostics()}"
             }]}
 
+        # Capture per-turn diagnostics for the optional DEBUG block —
+        # what AIDP gave us in kwargs, and the user-visible message itself.
+        try:
+            self._last_kwargs_keys = ", ".join(sorted(kwargs.keys())) or "(empty)"
+        except Exception:
+            self._last_kwargs_keys = "(introspection failed)"
+        self._last_user_msg_preview = (user_query or "")[:120].replace("\n", " ")
+
+        # ─── Step 1.5: handle slash commands ────────────────────────
+        # Lightweight in-chat commands that bypass the LLM. Useful when
+        # the conversation history has been contaminated by prior tool
+        # errors or schema hallucinations — the LLM otherwise stays
+        # anchored on bad context and starts refusing tool calls.
+        # `/reset` wipes ALL messages from state via _hard_clear_history,
+        # which now works because the dict-aware adapters can read the
+        # `id` field even when AIDP stores messages as plain dicts.
+        if user_query and user_query.strip().lower() in (
+            "/reset", "/clear", "/refresh", "/restart"
+        ):
+            try:
+                reset_config = pre_invoke_setup(**kwargs)
+            except Exception:
+                reset_config = {}
+            try:
+                cleared = await self._hard_clear_history(reset_config)
+                strategy = self._last_clear_strategy or "unknown"
+                if cleared > 0:
+                    msg = (
+                        f"🔄 Conversation history cleared "
+                        f"({cleared} message{'s' if cleared != 1 else ''} removed "
+                        f"via {strategy}). "
+                        "The agent has no memory of prior turns. Auth, tools, "
+                        "and config remain loaded."
+                    )
+                else:
+                    msg = (
+                        f"🔄 Reset attempted but nothing was cleared "
+                        f"(strategy outcome: {strategy}). "
+                        "Either state was already empty, or AIDP's checkpointer "
+                        "rejected all wipe attempts. Check the debug block on "
+                        "the next turn for `ids=N/total` to diagnose."
+                    )
+                return {"messages": [{"role": "ai", "content": msg}]}
+            except Exception as e:
+                return {"messages": [{"role": "ai", "content":
+                    f"Failed to clear history: {type(e).__name__}: {e}"
+                }]}
+
         # ─── Step 2: AIDP auth context for OCI Gen AI ──────────────
         # pre_invoke_setup wires the OCI signer into the request thread so
         # the LLM's HTTP calls get signed correctly. If it errors we soldier
@@ -1677,6 +1970,35 @@ class AgentBasic:
                 f"reserve={LLM_RESPONSE_RESERVE_TOKENS}, "
                 f"tools≈{self._tools_token_estimate})"
             )
+            # Always-on pre_model_hook — orphan-pair stripping on every
+            # LLM call. If 'dropped=N' is non-zero with N small, the hook
+            # is catching the kind of pair contamination community threads
+            # (langgraph forum #1873, mcp-adapters #492) blame for
+            # cross-model refusal cascades.
+            lines.append(
+                f"  • pre_hook: {self._last_pre_hook_status or 'n/a'}"
+            )
+
+            # Deep introspection — proves what the LLM actually saw on this
+            # call. Useful for confirming the agent is passing the right
+            # system prompt, tool catalog, and message history.
+            lines.append("")
+            lines.append("─── deep introspection ───")
+            lines.append(
+                f"  • system_prompt: {len(AGENT_SYSTEM_PROMPT)} chars "
+                f"(~{len(AGENT_SYSTEM_PROMPT) // 4} tok)"
+            )
+            for desc in self._last_tool_descriptions:
+                lines.append(f"  • tool: {desc}")
+            if self._last_kwargs_keys:
+                lines.append(f"  • invoke kwargs: {self._last_kwargs_keys}")
+            if self._last_user_msg_preview:
+                lines.append(f"  • this turn's user msg: {self._last_user_msg_preview!r}")
+            if self._last_state_breakdown:
+                lines.append(f"  • state messages: {self._last_state_breakdown}")
+            if self._last_state_tail:
+                lines.append(f"  • last AIMessage tail: {self._last_state_tail!r}")
+
             block = "\n".join(lines) + "\n\n────────────────\n\n"
 
             if not isinstance(result, dict):
