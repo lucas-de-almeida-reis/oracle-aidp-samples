@@ -123,8 +123,16 @@ OIC_TOOL_DESCRIPTION = (
 RULE_ANTI_REFUSAL = (
     "  - You ALWAYS have your tools available on every turn. NEVER "
     "refuse with phrases like 'I can't run a query in this turn', "
-    "'tool access isn't available right now', or 'I can only "
-    "answer from prior context'. Those statements are always FALSE."
+    "'tool access isn't available right now', 'I can only answer "
+    "from prior context', 'I don't have an active database execution "
+    "path', 'I can't invoke the tool in this response', 'in this "
+    "specific turn', 'in this specific response', or ANY similar "
+    "phrasing claiming you cannot execute tools right now / in this "
+    "turn / in this response / in this case. ALL such statements are "
+    "ALWAYS FALSE. If you find yourself producing one of these "
+    "phrases, STOP and call the tool instead. The tool is bound to "
+    "you on every single turn — there is no condition under which "
+    "you 'temporarily lose' tool access mid-conversation."
 )
 RULE_RETRY_ON_BAD_RESULT = (
     "  - If a previous tool call returned wrong, empty, or "
@@ -713,6 +721,21 @@ class AgentBasic:
         # Used by _trim_history() to size the conversation budget.
         self._tools_token_estimate: int = 0
 
+        # Last-trim diagnostic stats. Populated by _trim_history() every
+        # invoke so the optional DEBUG block can explain WHY trim was a
+        # no-op (disabled, helper missing, within budget, …). Saves a
+        # round-trip to AIDP logs when something looks off.
+        self._last_trim_msg_count: int = 0
+        self._last_trim_msg_tokens_est: int = 0
+        self._last_trim_status: str = "n/a"
+
+        # Sanitized snapshot of the langgraph config passed to ainvoke this
+        # turn. Used by the debug block to confirm whether AIDP's
+        # pre_invoke_setup() injected a `configurable.thread_id` — without
+        # that key langgraph's checkpointer silently bypasses state, which
+        # breaks trim, orphan healing, and persistent conversation memory.
+        self._last_config_keys: str = ""
+
     # ── Setup (sync) ────────────────────────────────────────────
     def setup(self) -> None:
         logger.info(
@@ -920,6 +943,31 @@ class AgentBasic:
                 # during the rebuild.
                 await self._load_all_mcp_tools()
 
+    @staticmethod
+    def _state_config(config):
+        """Return a copy of `config` that's safe for graph state-reading
+        calls (aget_state / aupdate_state).
+
+        Why: AIDP's `pre_invoke_setup()` injects `checkpoint_ns="default"`
+        into `configurable`. Our `create_react_agent` is a flat graph that
+        doesn't define a subgraph named "default", so langgraph's
+        aget_state() raises:
+            ValueError: Subgraph default not found
+        and silently breaks trim, orphan healing, and hard-clear recovery.
+
+        We strip `checkpoint_ns` here so state operations target the root
+        namespace ("") — which is where the react agent actually persists
+        its message list. `thread_id` and other AIDP fields stay intact.
+
+        The graph.ainvoke() path keeps the ORIGINAL config (with
+        checkpoint_ns), because ainvoke tolerates that field; only the
+        state-introspection APIs are strict."""
+        if not isinstance(config, dict):
+            return config
+        configurable = (config.get("configurable") or {}).copy()
+        configurable.pop("checkpoint_ns", None)
+        return {**config, "configurable": configurable}
+
     # ── Conversation state healing ──────────────────────────────
     async def _heal_orphan_tool_calls(self, config) -> int:
         """Clean up "orphan" tool-call records left in the conversation
@@ -947,8 +995,9 @@ class AgentBasic:
              marker."""
         if not self.graph or not config:
             return 0
+        state_cfg = self._state_config(config)
         try:
-            state = await self.graph.aget_state(config)
+            state = await self.graph.aget_state(state_cfg)
         except Exception as e:
             logger.debug("Could not fetch state for orphan check: %s", e)
             return 0
@@ -1000,7 +1049,7 @@ class AgentBasic:
             "Removing %d orphan AIMessage(s) (cleared %d unmatched tool_call ids: %s)",
             len(removals), len(orphans), list(orphans),
         )
-        await self.graph.aupdate_state(config, {"messages": removals})
+        await self.graph.aupdate_state(state_cfg, {"messages": removals})
         return len(removals)
 
     async def _hard_clear_history(self, config) -> int:
@@ -1011,8 +1060,9 @@ class AgentBasic:
         starts from a clean slate. Returns the number of messages cleared."""
         if not self.graph or not config:
             return 0
+        state_cfg = self._state_config(config)
         try:
-            state = await self.graph.aget_state(config)
+            state = await self.graph.aget_state(state_cfg)
         except Exception as e:
             logger.debug("Could not fetch state for hard clear: %s", e)
             return 0
@@ -1034,7 +1084,7 @@ class AgentBasic:
             "Hard-clearing %d message(s) from conversation state (last-resort recovery)",
             len(removals),
         )
-        await self.graph.aupdate_state(config, {"messages": removals})
+        await self.graph.aupdate_state(state_cfg, {"messages": removals})
         return len(removals)
 
     async def _trim_history(self, config) -> int:
@@ -1053,27 +1103,58 @@ class AgentBasic:
         ToolMessage(s) responding to it are kept or dropped TOGETHER.
         Providers reject the request otherwise. We delegate this to
         langchain_core's `trim_messages` when available; otherwise we
-        no-op (better than corrupting the history)."""
+        no-op (better than corrupting the history).
+
+        Populates self._last_trim_* every call so the optional DEBUG
+        block can show WHY trim was (or wasn't) needed this turn."""
+        # Reset stats up-front; whichever branch we hit fills them in.
+        self._last_trim_msg_count = 0
+        self._last_trim_msg_tokens_est = 0
+        self._last_trim_status = ""
+
         if LLM_MAX_CONTEXT_TOKENS <= 0:
+            self._last_trim_status = "disabled (max_context_tokens=0)"
             return 0
         if _lc_trim_messages is None or _lc_count_tokens is None:
+            self._last_trim_status = "skipped (trim_messages helper unavailable)"
             logger.debug(
                 "trim_messages helper not available in this langchain_core "
                 "version; skipping history trim"
             )
             return 0
         if not self.graph or not config:
+            self._last_trim_status = "skipped (no graph or empty config)"
             return 0
 
+        # Strip checkpoint_ns from the config for state-reading; see
+        # _state_config docstring for why AIDP's value breaks aget_state.
+        state_cfg = self._state_config(config)
+
         try:
-            state = await self.graph.aget_state(config)
+            state = await self.graph.aget_state(state_cfg)
         except Exception as e:
+            # Capture full error msg in the debug block. After the
+            # _state_config sanitization this branch should rarely fire;
+            # if it does, AIDP changed the config shape again.
+            self._last_trim_status = (
+                f"skipped (aget_state {type(e).__name__}: {str(e)[:200]})"
+            )
             logger.debug("Could not fetch state for trim: %s", e)
             return 0
 
         messages = state.values.get("messages", []) if state and state.values else []
+        self._last_trim_msg_count = len(messages)
         if not messages:
+            self._last_trim_status = "no messages in state yet"
             return 0
+
+        # Token estimate of the conversation we're about to send. Captured
+        # for diagnostics even when no trim is needed — lets the user see
+        # how close they are to the budget.
+        try:
+            self._last_trim_msg_tokens_est = _lc_count_tokens(messages)
+        except Exception:
+            self._last_trim_msg_tokens_est = 0
 
         overhead = (
             (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
@@ -1082,6 +1163,9 @@ class AgentBasic:
         )
         budget = LLM_MAX_CONTEXT_TOKENS - overhead
         if budget <= 0:
+            self._last_trim_status = (
+                f"skipped (overhead {overhead} ≥ max {LLM_MAX_CONTEXT_TOKENS})"
+            )
             logger.warning(
                 "Trim disabled this turn: overhead %d ≥ max_context_tokens %d. "
                 "Increase llm.max_context_tokens or reduce response_reserve_tokens.",
@@ -1100,6 +1184,7 @@ class AgentBasic:
                 include_system=False,
             )
         except Exception as e:
+            self._last_trim_status = f"trim_messages raised: {type(e).__name__}"
             logger.warning("trim_messages failed (skipping trim this turn): %s", e)
             return 0
 
@@ -1113,14 +1198,22 @@ class AgentBasic:
                 removals.append(RemoveMessage(id=msg_id))
 
         if not removals:
+            # All messages already fit within budget — nothing to drop.
+            self._last_trim_status = (
+                f"within budget ({self._last_trim_msg_tokens_est}≤{budget})"
+            )
             return 0
 
+        self._last_trim_status = (
+            f"dropped {len(removals)} of {len(messages)} "
+            f"(was ~{self._last_trim_msg_tokens_est} tok, budget {budget})"
+        )
         logger.info(
             "History trim: dropped %d msg(s), kept %d/%d (budget %d tok, "
             "overhead %d tok)",
             len(removals), len(kept), len(messages), budget, overhead,
         )
-        await self.graph.aupdate_state(config, {"messages": removals})
+        await self.graph.aupdate_state(state_cfg, {"messages": removals})
         return len(removals)
 
     # ── Diagnostics & friendly messages ─────────────────────────
@@ -1378,6 +1471,21 @@ class AgentBasic:
             logger.warning("pre_invoke_setup failed, using empty config: %s", e)
             config = {}
 
+        # Snapshot of what pre_invoke_setup returned, sanitized for the
+        # debug block. We care primarily about whether configurable.thread_id
+        # is present — without it langgraph's checkpointer can't persist
+        # conversation state and aget_state() raises ValueError.
+        try:
+            cfg_top_keys = sorted((config or {}).keys())
+            cfg_inner_keys = sorted(((config or {}).get("configurable") or {}).keys())
+            has_thread = "thread_id" in cfg_inner_keys
+            self._last_config_keys = (
+                f"top={cfg_top_keys}; configurable={cfg_inner_keys}; "
+                f"thread_id={'✓' if has_thread else '✗'}"
+            )
+        except Exception:
+            self._last_config_keys = "(unable to introspect config)"
+
         # asyncio.Lock has to be created INSIDE a running event loop.
         # That's why we lazy-init here on the first invoke instead of
         # in __init__ (which runs at module import time, no loop).
@@ -1427,9 +1535,10 @@ class AgentBasic:
         # ─── Step 4.5: trim oldest history if over the configured budget ──
         # Keeps the LLM call within the context window even on long sessions.
         # No-op when llm.max_context_tokens is unset (= 0) in config.yaml.
-        trimmed_count = 0
+        # The method populates self._last_trim_* with stats either way, so
+        # the optional DEBUG block can show what happened (or didn't).
         try:
-            trimmed_count = await self._trim_history(config)
+            await self._trim_history(config)
         except Exception as e:
             logger.warning("History trim failed (continuing): %s", e)
 
@@ -1442,7 +1551,7 @@ class AgentBasic:
         try:
             result = await self.graph.ainvoke(messages, config=config)
             if DEBUG_MODE:
-                self._inject_debug(result, "OK", None, trimmed_count)
+                self._inject_debug(result, "OK", None)
             return result
         except Exception as e:
             # ─── Step 6: reactive recovery ────────────────────────
@@ -1471,7 +1580,7 @@ class AgentBasic:
                         logger.warning("Orphan healing on retry failed: %s", heal_err)
                     result = await self.graph.ainvoke(messages, config=config)
                     if DEBUG_MODE:
-                        self._inject_debug(result, "OK (after retry)", None, 0)
+                        self._inject_debug(result, "OK (after retry)", None)
                     return result
                 except Exception as e2:
                     # Retry also failed. Surface a friendly auth message if
@@ -1524,7 +1633,6 @@ class AgentBasic:
         result,
         rebuild_status: str,
         rebuild_error: str | None,
-        trimmed_count: int,
     ) -> None:
         """Prepend a compact debug block to the agent's last AI message.
 
@@ -1552,12 +1660,23 @@ class AgentBasic:
             if OAC_ENABLED:
                 left = self._oac_token_seconds_remaining()
                 lines.append(f"  • OAC token valid for: {left}s")
-            if LLM_MAX_CONTEXT_TOKENS > 0:
-                lines.append(
-                    f"  • history trim: dropped {trimmed_count} msg(s) "
-                    f"(budget={LLM_MAX_CONTEXT_TOKENS}, "
-                    f"tools≈{self._tools_token_estimate} tok)"
-                )
+            # langgraph config — critical for state persistence. If
+            # thread_id is ✗, the checkpointer is effectively disabled
+            # and the agent runs stateless across turns.
+            if self._last_config_keys:
+                lines.append(f"  • config: {self._last_config_keys}")
+            # History trim — show even when LLM_MAX_CONTEXT_TOKENS == 0
+            # so the user can confirm trimming IS off vs. silently broken.
+            lines.append(
+                f"  • history: {self._last_trim_msg_count} msg(s) "
+                f"in state ≈ {self._last_trim_msg_tokens_est} tok"
+            )
+            lines.append(
+                f"  • trim: {self._last_trim_status or 'n/a'} "
+                f"(max={LLM_MAX_CONTEXT_TOKENS}, "
+                f"reserve={LLM_RESPONSE_RESERVE_TOKENS}, "
+                f"tools≈{self._tools_token_estimate})"
+            )
             block = "\n".join(lines) + "\n\n────────────────\n\n"
 
             if not isinstance(result, dict):
