@@ -24,8 +24,10 @@ Quick architecture:
   • OAC's access_token has a 5-minute TTL — short enough that AIDP's
     idle-suspend can wake the agent up with a long-expired bearer
     cached in MCP's headers. To handle that, every invoke() runs
-    _ensure_fresh_oac_token() at the top, which checks the cached
-    JWT's exp claim and mints a fresh one if there's <60s remaining.
+    _ensure_fresh_tokens() at the top, which checks the cached JWT's
+    exp claim and mints a fresh one if there's <60s remaining. The
+    same method also rebuilds MCP when its graph age has exceeded
+    MCP_REBUILD_AGE_SECS so ADB/OIC bearers stay fresh.
     Cheap when fresh (one JWT decode); ~300ms refresh when needed.
   • If a tool call still fails with 401/connection error despite the
     proactive refresh, the reactive retry in invoke() catches that,
@@ -67,23 +69,6 @@ logger = logging.getLogger(__name__)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║   DEBUG_MODE — flip to True to surface runtime diagnostics    ║
-# ║                                                              ║
-# ║   When True, every chat reply gets a small "🔧 DEBUG" block  ║
-# ║   prepended showing:                                         ║
-# ║     - which tools the agent had bound this turn              ║
-# ║     - whether the token-freshness check rebuilt MCP          ║
-# ║     - OAC token TTL (if OAC enabled)                         ║
-# ║     - MCP graph age (relevant for ADB/OIC bearer freshness)  ║
-# ║     - history trim activity (if max_context_tokens > 0)      ║
-# ║                                                              ║
-# ║   Useful when AIDP logs aren't accessible. Leave False in    ║
-# ║   production — the debug helper short-circuits in one if.    ║
-# ╚══════════════════════════════════════════════════════════════╝
-DEBUG_MODE = False
-
-
-# ╔══════════════════════════════════════════════════════════════╗
 # ║   System-prompt strings — edit here to tune agent behavior   ║
 # ║                                                              ║
 # ║   _build_system_prompt() further down assembles these based  ║
@@ -120,20 +105,6 @@ OIC_TOOL_DESCRIPTION = (
 )
 
 # Always-on rules — included regardless of integration set.
-RULE_ANTI_REFUSAL = (
-    "  - You ALWAYS have your tools available on every turn. NEVER "
-    "refuse with phrases like 'I can't run a query in this turn', "
-    "'tool access isn't available right now', 'I can only answer "
-    "from prior context', 'I don't have an active database execution "
-    "path', 'I can't invoke the tool in this response', 'in this "
-    "specific turn', 'in this specific response', or ANY similar "
-    "phrasing claiming you cannot execute tools right now / in this "
-    "turn / in this response / in this case. ALL such statements are "
-    "ALWAYS FALSE. If you find yourself producing one of these "
-    "phrases, STOP and call the tool instead. The tool is bound to "
-    "you on every single turn — there is no condition under which "
-    "you 'temporarily lose' tool access mid-conversation."
-)
 RULE_RETRY_ON_BAD_RESULT = (
     "  - If a previous tool call returned wrong, empty, or "
     "unexpected results, do NOT stop using tools. User "
@@ -146,22 +117,6 @@ RULE_DISCOVER_FIRST = (
     "which table or column to use, run a discovery call FIRST "
     "(e.g. list tables, describe columns) and base the real query "
     "on the result. Do NOT guess."
-)
-RULE_TOOL_BEFORE_EXPLAIN = (
-    "  - For ANY data question — simple or complex — your FIRST "
-    "action is to call the tool. Do NOT narrate your plan in text "
-    "before calling. Do NOT write 'I'll do X, then Y, then Z' and "
-    "stop there. Call the tool first, then summarize what it "
-    "returned. If a question requires multiple tool calls, just "
-    "make them sequentially — don't pre-announce the plan."
-)
-RULE_VERIFY_OWN_CLAIMS = (
-    "  - NEVER rely on your memory of prior schema statements. If "
-    "you said earlier that a column or table doesn't exist and the "
-    "user now references it, run a fresh discovery call BEFORE "
-    "responding. Your prior statement may have been wrong, and the "
-    "user knowing the schema is more reliable evidence than your "
-    "earlier guess. Verify, then act."
 )
 RULE_PRESERVE_INTENT = (
     "  - Preserve the user's intent. You MAY enrich the question "
@@ -340,13 +295,9 @@ def _build_system_prompt() -> str:
     parts.append("")
     parts.append("Rules:")
 
-    # Always-on rules (anti-refusal block first — most important on
-    # smaller / non-reasoning LLMs that fall into refusal cascades).
-    parts.append(RULE_ANTI_REFUSAL)
+    # Always-on rules.
     parts.append(RULE_RETRY_ON_BAD_RESULT)
     parts.append(RULE_DISCOVER_FIRST)
-    parts.append(RULE_TOOL_BEFORE_EXPLAIN)
-    parts.append(RULE_VERIFY_OWN_CLAIMS)
 
     # Per-integration rules
     if ADB_ENABLED:
@@ -372,10 +323,9 @@ llm_conf = OCIAIConf(
     model_args={},
     endpoint=f"https://inference.generativeai.{LLM_REGION}.oci.oraclecloud.com",
     model_id=LLM_MODEL_ID,
-    # Guardrails disabled by default — the wrapped `GuardedChatOCIGenAI`
-    # was empirically interfering with tool-call routing on some models.
-    # Re-enable by swapping to the commented line below if you need OCI
-    # Gen AI's content-safety policies.
+    # Guardrails disabled by default — minimal config for the sample.
+    # Swap to the commented line below if you need OCI Gen AI's
+    # content-safety policies enabled.
     guardrails_config={},
     # guardrails_config={"name": "Default", "description": "", "policies": []},
 )
@@ -730,8 +680,8 @@ class AgentBasic:
         self._mcp_built_epoch: float = 0.0
 
         # Catalog snapshot: tool names from the most recent successful
-        # build. Used by the optional debug instrumentation and by the
-        # trim budget calculator.
+        # build. Logged at MCP load time so AIDP logs show which tools
+        # were bound.
         self._last_tool_names: list[str] = []
 
         # Approximate token cost of the bound tool definitions (names +
@@ -739,44 +689,11 @@ class AgentBasic:
         # Used by _trim_history() to size the conversation budget.
         self._tools_token_estimate: int = 0
 
-        # Last-trim diagnostic stats. Populated by _trim_history() every
-        # invoke so the optional DEBUG block can explain WHY trim was a
-        # no-op (disabled, helper missing, within budget, …). Saves a
-        # round-trip to AIDP logs when something looks off.
-        self._last_trim_msg_count: int = 0
-        self._last_trim_msg_tokens_est: int = 0
-        self._last_trim_status: str = "n/a"
-
-        # Last pre_model_hook activity. The hook runs INSIDE the graph
-        # before every LLM call and filters out orphan tool_call /
-        # ToolMessage pairs that providers (OCI generic / OpenAI /
-        # Anthropic) silently choke on — the leading suspect for
-        # cross-model refusal cascades per langgraph forum #1873.
-        # Always-on (no opt-in flag); only structural-cleanup when
-        # max_context_tokens=0, also budget-caps when > 0.
-        self._last_pre_hook_status: str = "n/a"
-
-        # Sanitized snapshot of the langgraph config passed to ainvoke this
-        # turn. Used by the debug block to confirm whether AIDP's
-        # pre_invoke_setup() injected a `configurable.thread_id` — without
-        # that key langgraph's checkpointer silently bypasses state, which
-        # breaks trim, orphan healing, and persistent conversation memory.
-        self._last_config_keys: str = ""
-
-        # ── Deep introspection snapshots ────────────────────────────
-        # Populated each turn so the DEBUG block can prove *exactly*
-        # what the LLM saw. When the model refuses tool calls, these
-        # let an operator verify the inputs were correct.
-        self._last_tool_descriptions: list[str] = []   # "name — first 100 chars of description"
-        self._last_state_breakdown: str = ""          # "human=N ai=N tool=N tool_errors=N orphan_tc=N"
-        self._last_kwargs_keys: str = ""              # what AIDP passed in **kwargs
-        self._last_user_msg_preview: str = ""         # this turn's user input (truncated)
-        self._last_state_tail: str = ""               # last AIMessage excerpt from state
-
-        # Last hard-clear strategy used. Set by _hard_clear_history to
-        # one of "batch RemoveMessage" / "one-at-a-time" / "adelete_thread"
-        # so the /reset chat response can report which path actually
-        # worked (logs aren't always accessible to the operator).
+        # Outcome of the last _hard_clear_history attempt. Set to
+        # "one-at-a-time (N/M removed)", "no removable ids", or
+        # "failed (...)" so the /reset chat response can report what
+        # actually happened (logs aren't always accessible to the
+        # operator).
         self._last_clear_strategy: str = ""
 
     # ── Setup (sync) ────────────────────────────────────────────
@@ -823,7 +740,6 @@ class AgentBasic:
         self.llm = init_oci_llm(llm_conf)
         self.graph = create_react_agent(
             self.llm, [], prompt=AGENT_SYSTEM_PROMPT, checkpointer=checkpointer,
-            pre_model_hook=self._pre_model_hook,
         )
         logger.info("Stub graph ready; will load MCP tools on first invoke")
 
@@ -853,19 +769,13 @@ class AgentBasic:
 
         self._last_tool_names = [t.name for t in tools]
 
-        # Estimate token cost of tool definitions for the trim budget AND
-        # capture name + first 120 chars of description per tool so the
-        # DEBUG block can prove exactly what the LLM is seeing.
+        # Estimate token cost of tool definitions for the trim budget.
         estimate = 0
-        descs: list[str] = []
         for t in tools:
             name = getattr(t, "name", "") or ""
             desc = getattr(t, "description", "") or ""
             estimate += (len(name) + len(desc)) // 4 + 40
-            desc_excerpt = desc.replace("\n", " ").strip()[:120]
-            descs.append(f"{name} — {desc_excerpt}" if desc_excerpt else name)
         self._tools_token_estimate = estimate
-        self._last_tool_descriptions = descs
 
         logger.info(
             "Loaded %d tool(s) from %d MCP server(s) [ephemeral sessions]: %s "
@@ -873,11 +783,10 @@ class AgentBasic:
             len(tools), len(cfg), self._last_tool_names, self._tools_token_estimate,
         )
         # Re-create the LangGraph react agent with the freshly loaded
-        # tools. The system prompt, checkpointer, and pre_model_hook
-        # carry over so chat state isn't lost when we rebuild.
+        # tools. The system prompt and checkpointer carry over so chat
+        # state isn't lost when we rebuild.
         self.graph = create_react_agent(
             self.llm, tools, prompt=AGENT_SYSTEM_PROMPT, checkpointer=checkpointer,
-            pre_model_hook=self._pre_model_hook,
         )
         self._tools_loaded = True
         self._mcp_built_epoch = time.time()
@@ -1223,81 +1132,6 @@ class AgentBasic:
         )
         return 0
 
-    def _pre_model_hook(self, state):
-        """Always-on history hygiene for every LLM call.
-
-        Runs INSIDE the graph immediately before each model invocation
-        (langgraph prebuilt's `pre_model_hook` slot). Returns a filtered
-        message list under `llm_input_messages` — does NOT mutate
-        persistent state, so /reset and the DEBUG block still see the
-        full history.
-
-        Why this exists: create_react_agent passes the entire message
-        history to the LLM every turn with no built-in hygiene. Once
-        history grows and pairs get out of sync, providers (OCI generic,
-        OpenAI, Anthropic) silently fall back to refusal-flavored
-        responses instead of calling tools. The langgraph community's
-        recommended remedy is exactly this:
-            trim_messages(start_on="human", end_on=("human","tool"))
-        applied on every LLM call to guarantee a well-formed
-        sub-sequence reaches the model.
-
-        Token cap behavior:
-            • LLM_MAX_CONTEXT_TOKENS > 0 → cap to
-              max - reserve - system - tools (same formula as the
-              opt-in _trim_history path).
-            • LLM_MAX_CONTEXT_TOKENS == 0 → effectively unlimited
-              (1_000_000 budget). Hook still runs because
-              start_on/end_on do pair-integrity cleanup regardless of
-              budget.
-
-        Sync on purpose: langgraph supports both sync and async hooks,
-        and there's nothing to await here (pure in-memory transform)."""
-        messages = (state or {}).get("messages", []) or []
-
-        if not messages or _lc_trim_messages is None or _lc_count_tokens is None:
-            self._last_pre_hook_status = (
-                f"skipped (in={len(messages)}, helpers="
-                f"{'ok' if _lc_trim_messages else 'missing'})"
-            )
-            return {"llm_input_messages": messages}
-
-        if LLM_MAX_CONTEXT_TOKENS > 0:
-            overhead = (
-                (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
-                + self._tools_token_estimate
-                + LLM_RESPONSE_RESERVE_TOKENS
-            )
-            budget = max(LLM_MAX_CONTEXT_TOKENS - overhead, 1024)
-            mode = f"budget={budget}"
-        else:
-            budget = 1_000_000
-            mode = "structural-only"
-
-        try:
-            kept = _lc_trim_messages(
-                messages,
-                max_tokens=budget,
-                strategy="last",
-                token_counter=_lc_count_tokens,
-                allow_partial=False,
-                start_on="human",
-                end_on=("human", "tool"),
-                include_system=False,
-            )
-        except Exception as e:
-            self._last_pre_hook_status = (
-                f"trim raised {type(e).__name__}: {str(e)[:120]}; "
-                f"passing through {len(messages)} msgs"
-            )
-            return {"llm_input_messages": messages}
-
-        dropped = len(messages) - len(kept)
-        self._last_pre_hook_status = (
-            f"in={len(messages)} out={len(kept)} dropped={dropped} ({mode})"
-        )
-        return {"llm_input_messages": kept}
-
     async def _trim_history(self, config) -> int:
         """Drop oldest conversation turns when the running history would
         push the next LLM call past the configured context budget.
@@ -1314,27 +1148,16 @@ class AgentBasic:
         ToolMessage(s) responding to it are kept or dropped TOGETHER.
         Providers reject the request otherwise. We delegate this to
         langchain_core's `trim_messages` when available; otherwise we
-        no-op (better than corrupting the history).
-
-        Populates self._last_trim_* every call so the optional DEBUG
-        block can show WHY trim was (or wasn't) needed this turn."""
-        # Reset stats up-front; whichever branch we hit fills them in.
-        self._last_trim_msg_count = 0
-        self._last_trim_msg_tokens_est = 0
-        self._last_trim_status = ""
-
+        no-op (better than corrupting the history)."""
         if LLM_MAX_CONTEXT_TOKENS <= 0:
-            self._last_trim_status = "disabled (max_context_tokens=0)"
             return 0
         if _lc_trim_messages is None or _lc_count_tokens is None:
-            self._last_trim_status = "skipped (trim_messages helper unavailable)"
             logger.debug(
                 "trim_messages helper not available in this langchain_core "
                 "version; skipping history trim"
             )
             return 0
         if not self.graph or not config:
-            self._last_trim_status = "skipped (no graph or empty config)"
             return 0
 
         # Strip checkpoint_ns from the config for state-reading; see
@@ -1344,62 +1167,12 @@ class AgentBasic:
         try:
             state = await self.graph.aget_state(state_cfg)
         except Exception as e:
-            # Capture full error msg in the debug block. After the
-            # _state_config sanitization this branch should rarely fire;
-            # if it does, AIDP changed the config shape again.
-            self._last_trim_status = (
-                f"skipped (aget_state {type(e).__name__}: {str(e)[:200]})"
-            )
             logger.debug("Could not fetch state for trim: %s", e)
             return 0
 
         messages = state.values.get("messages", []) if state and state.values else []
-        self._last_trim_msg_count = len(messages)
-
-        # Walk the messages once to build a debug-friendly breakdown:
-        # types (via dict-aware adapter), count of tool-error messages,
-        # last AI message tail, and how many message ids we can target.
-        type_counts: dict[str, int] = {}
-        tool_error_count = 0
-        last_ai_excerpt = ""
-        ids_present = 0
-        for msg in messages:
-            kind = self._msg_type(msg).lower()
-            type_counts[kind] = type_counts.get(kind, 0) + 1
-            if self._msg_id(msg):
-                ids_present += 1
-            # Tool errors — common contaminant of GPT defensive-mode cascades.
-            if kind in ("tool", "toolmessage"):
-                content = self._msg_content(msg).lower()
-                if content and any(
-                    s in content for s in
-                    ("error", "exception", "ora-", "invalid", "fail")
-                ):
-                    tool_error_count += 1
-            if kind in ("ai", "aimessage"):
-                c = self._msg_content(msg).strip()
-                if c:
-                    last_ai_excerpt = c[:160].replace("\n", " ")
-        # Compact summary. ids_present is critical — if it's 0 then
-        # _hard_clear_history / orphan-heal cannot remove anything.
-        self._last_state_breakdown = (
-            " ".join(f"{k}={v}" for k, v in sorted(type_counts.items()))
-            + (f" tool_errors={tool_error_count}" if tool_error_count else "")
-            + f" ids={ids_present}/{len(messages)}"
-        )
-        self._last_state_tail = last_ai_excerpt
-
         if not messages:
-            self._last_trim_status = "no messages in state yet"
             return 0
-
-        # Token estimate of the conversation we're about to send. Captured
-        # for diagnostics even when no trim is needed — lets the user see
-        # how close they are to the budget.
-        try:
-            self._last_trim_msg_tokens_est = _lc_count_tokens(messages)
-        except Exception:
-            self._last_trim_msg_tokens_est = 0
 
         overhead = (
             (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
@@ -1408,9 +1181,6 @@ class AgentBasic:
         )
         budget = LLM_MAX_CONTEXT_TOKENS - overhead
         if budget <= 0:
-            self._last_trim_status = (
-                f"skipped (overhead {overhead} ≥ max {LLM_MAX_CONTEXT_TOKENS})"
-            )
             logger.warning(
                 "Trim disabled this turn: overhead %d ≥ max_context_tokens %d. "
                 "Increase llm.max_context_tokens or reduce response_reserve_tokens.",
@@ -1429,7 +1199,6 @@ class AgentBasic:
                 include_system=False,
             )
         except Exception as e:
-            self._last_trim_status = f"trim_messages raised: {type(e).__name__}"
             logger.warning("trim_messages failed (skipping trim this turn): %s", e)
             return 0
 
@@ -1443,16 +1212,8 @@ class AgentBasic:
                 removals.append(RemoveMessage(id=msg_id))
 
         if not removals:
-            # All messages already fit within budget — nothing to drop.
-            self._last_trim_status = (
-                f"within budget ({self._last_trim_msg_tokens_est}≤{budget})"
-            )
             return 0
 
-        self._last_trim_status = (
-            f"dropped {len(removals)} of {len(messages)} "
-            f"(was ~{self._last_trim_msg_tokens_est} tok, budget {budget})"
-        )
         logger.info(
             "History trim: dropped %d msg(s), kept %d/%d (budget %d tok, "
             "overhead %d tok)",
@@ -1706,14 +1467,6 @@ class AgentBasic:
                 f"Runtime diagnostics:\n{self._runtime_diagnostics()}"
             }]}
 
-        # Capture per-turn diagnostics for the optional DEBUG block —
-        # what AIDP gave us in kwargs, and the user-visible message itself.
-        try:
-            self._last_kwargs_keys = ", ".join(sorted(kwargs.keys())) or "(empty)"
-        except Exception:
-            self._last_kwargs_keys = "(introspection failed)"
-        self._last_user_msg_preview = (user_query or "")[:120].replace("\n", " ")
-
         # ─── Step 1.5: handle slash commands ────────────────────────
         # Lightweight in-chat commands that bypass the LLM. Useful when
         # the conversation history has been contaminated by prior tool
@@ -1763,21 +1516,6 @@ class AgentBasic:
         except Exception as e:
             logger.warning("pre_invoke_setup failed, using empty config: %s", e)
             config = {}
-
-        # Snapshot of what pre_invoke_setup returned, sanitized for the
-        # debug block. We care primarily about whether configurable.thread_id
-        # is present — without it langgraph's checkpointer can't persist
-        # conversation state and aget_state() raises ValueError.
-        try:
-            cfg_top_keys = sorted((config or {}).keys())
-            cfg_inner_keys = sorted(((config or {}).get("configurable") or {}).keys())
-            has_thread = "thread_id" in cfg_inner_keys
-            self._last_config_keys = (
-                f"top={cfg_top_keys}; configurable={cfg_inner_keys}; "
-                f"thread_id={'✓' if has_thread else '✗'}"
-            )
-        except Exception:
-            self._last_config_keys = "(unable to introspect config)"
 
         # asyncio.Lock has to be created INSIDE a running event loop.
         # That's why we lazy-init here on the first invoke instead of
@@ -1842,10 +1580,7 @@ class AgentBasic:
         messages = {"messages": [dict(user_message)]}
 
         try:
-            result = await self.graph.ainvoke(messages, config=config)
-            if DEBUG_MODE:
-                self._inject_debug(result, "OK", None)
-            return result
+            return await self.graph.ainvoke(messages, config=config)
         except Exception as e:
             # ─── Step 6: reactive recovery ────────────────────────
             # If the failure looks transient (auth/network), try once more
@@ -1871,10 +1606,7 @@ class AgentBasic:
                         await self._heal_orphan_tool_calls(config)
                     except Exception as heal_err:
                         logger.warning("Orphan healing on retry failed: %s", heal_err)
-                    result = await self.graph.ainvoke(messages, config=config)
-                    if DEBUG_MODE:
-                        self._inject_debug(result, "OK (after retry)", None)
-                    return result
+                    return await self.graph.ainvoke(messages, config=config)
                 except Exception as e2:
                     # Retry also failed. Surface a friendly auth message if
                     # we can classify it as an identifiable auth issue.
@@ -1920,103 +1652,6 @@ class AgentBasic:
             return {"messages": [{"role": "ai", "content":
                 self._try_again_message()
             }]}
-
-    def _inject_debug(
-        self,
-        result,
-        rebuild_status: str,
-        rebuild_error: str | None,
-    ) -> None:
-        """Prepend a compact debug block to the agent's last AI message.
-
-        Gated by the `DEBUG_MODE` constant at the top of this module.
-        When `DEBUG_MODE = False`, this method is never called.
-
-        Shows: turn timestamp, rebuild status, tool catalog the agent
-        had bound this turn, OAC token TTL if enabled, MCP graph age,
-        history trim stats. Useful when AIDP logs aren't accessible.
-        Mutates `result` in place — does not return."""
-        try:
-            ts = time.strftime("%H:%M:%S", time.gmtime())
-            tools_csv = ", ".join(self._last_tool_names) or "<none>"
-            lines = [
-                "🔧 DEBUG",
-                f"  • turn at {ts}Z",
-                f"  • rebuild: {rebuild_status}",
-                f"  • tools ({len(self._last_tool_names)}): {tools_csv}",
-            ]
-            if rebuild_error:
-                lines.append(f"  • rebuild error: {rebuild_error}")
-            if self._mcp_built_epoch:
-                age = int(time.time() - self._mcp_built_epoch)
-                lines.append(f"  • MCP graph age: {age}s")
-            if OAC_ENABLED:
-                left = self._oac_token_seconds_remaining()
-                lines.append(f"  • OAC token valid for: {left}s")
-            # langgraph config — critical for state persistence. If
-            # thread_id is ✗, the checkpointer is effectively disabled
-            # and the agent runs stateless across turns.
-            if self._last_config_keys:
-                lines.append(f"  • config: {self._last_config_keys}")
-            # History trim — show even when LLM_MAX_CONTEXT_TOKENS == 0
-            # so the user can confirm trimming IS off vs. silently broken.
-            lines.append(
-                f"  • history: {self._last_trim_msg_count} msg(s) "
-                f"in state ≈ {self._last_trim_msg_tokens_est} tok"
-            )
-            lines.append(
-                f"  • trim: {self._last_trim_status or 'n/a'} "
-                f"(max={LLM_MAX_CONTEXT_TOKENS}, "
-                f"reserve={LLM_RESPONSE_RESERVE_TOKENS}, "
-                f"tools≈{self._tools_token_estimate})"
-            )
-            # Always-on pre_model_hook — orphan-pair stripping on every
-            # LLM call. If 'dropped=N' is non-zero with N small, the hook
-            # is catching the kind of pair contamination community threads
-            # (langgraph forum #1873, mcp-adapters #492) blame for
-            # cross-model refusal cascades.
-            lines.append(
-                f"  • pre_hook: {self._last_pre_hook_status or 'n/a'}"
-            )
-
-            # Deep introspection — proves what the LLM actually saw on this
-            # call. Useful for confirming the agent is passing the right
-            # system prompt, tool catalog, and message history.
-            lines.append("")
-            lines.append("─── deep introspection ───")
-            lines.append(
-                f"  • system_prompt: {len(AGENT_SYSTEM_PROMPT)} chars "
-                f"(~{len(AGENT_SYSTEM_PROMPT) // 4} tok)"
-            )
-            for desc in self._last_tool_descriptions:
-                lines.append(f"  • tool: {desc}")
-            if self._last_kwargs_keys:
-                lines.append(f"  • invoke kwargs: {self._last_kwargs_keys}")
-            if self._last_user_msg_preview:
-                lines.append(f"  • this turn's user msg: {self._last_user_msg_preview!r}")
-            if self._last_state_breakdown:
-                lines.append(f"  • state messages: {self._last_state_breakdown}")
-            if self._last_state_tail:
-                lines.append(f"  • last AIMessage tail: {self._last_state_tail!r}")
-
-            block = "\n".join(lines) + "\n\n────────────────\n\n"
-
-            if not isinstance(result, dict):
-                return
-            msgs = result.get("messages") or []
-            if not msgs:
-                return
-            last = msgs[-1]
-            # langgraph returns BaseMessage objects; some chat UIs use dicts.
-            current = getattr(last, "content", None)
-            if current is not None:
-                last.content = block + (current or "")
-                return
-            if isinstance(last, dict):
-                last["content"] = block + (last.get("content") or "")
-        except Exception as e:
-            # Never let debug instrumentation break the response.
-            logger.warning("Debug injection failed (ignored): %s", e)
 
     @staticmethod
     def _try_again_message() -> str:

@@ -35,11 +35,6 @@ llm:
   response_reserve_tokens: 1024
 
 
-# Debug instrumentation is controlled by the `DEBUG_MODE` constant at
-# the top of agent.py (not via config.yaml). Set it to True to surface
-# a runtime diagnostic block in every chat reply.
-
-
 integrations:
 
   # ─── ADB Select AI MCP ───────────────────────────────────────────
