@@ -48,10 +48,142 @@ from langchain_core.messages import HumanMessage, RemoveMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 
+# Conversation-history trimming helpers. Available in langchain_core ≥0.3.
+# Fall back to None if the AIDP runtime ships an older version — the trim
+# feature then no-ops gracefully (logs a debug line and skips).
+try:
+    from langchain_core.messages.utils import (
+        count_tokens_approximately as _lc_count_tokens,
+        trim_messages as _lc_trim_messages,
+    )
+except ImportError:
+    _lc_count_tokens = None
+    _lc_trim_messages = None
+
 from aidputils.agents.toolkit.agent_helper import init_oci_llm, pre_invoke_setup
 from aidputils.agents.toolkit.configs import OCIAIConf
 
 logger = logging.getLogger(__name__)
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   DEBUG_MODE — flip to True to surface runtime diagnostics    ║
+# ║                                                              ║
+# ║   When True, every chat reply gets a small "🔧 DEBUG" block  ║
+# ║   prepended showing:                                         ║
+# ║     - which tools the agent had bound this turn              ║
+# ║     - whether the token-freshness check rebuilt MCP          ║
+# ║     - OAC token TTL (if OAC enabled)                         ║
+# ║     - MCP graph age (relevant for ADB/OIC bearer freshness)  ║
+# ║     - history trim activity (if max_context_tokens > 0)      ║
+# ║                                                              ║
+# ║   Useful when AIDP logs aren't accessible. Leave False in    ║
+# ║   production — the debug helper short-circuits in one if.    ║
+# ╚══════════════════════════════════════════════════════════════╝
+DEBUG_MODE = False
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   System-prompt strings — edit here to tune agent behavior   ║
+# ║                                                              ║
+# ║   _build_system_prompt() further down assembles these based  ║
+# ║   on which integrations are enabled in config.yaml. Per-     ║
+# ║   integration intros / rules are only included when the      ║
+# ║   matching integration is on.                                ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# Opening line — always included.
+SYSTEM_PROMPT_INTRO = (
+    "You are a helpful data assistant with access to tools loaded "
+    "from one or more MCP servers. Users ask data questions in "
+    "plain English; you answer them by calling the right tool."
+)
+
+# Per-integration tool descriptions (included when the integration is enabled).
+ADB_TOOL_DESCRIPTION = (
+    "  - ADB SelectAI tool: a natural-language-to-SQL agent over "
+    "an Oracle Autonomous Database. Pass questions in natural "
+    "language, fully qualified with table / column names whenever "
+    "the user has named them."
+)
+OAC_TOOL_DESCRIPTION = (
+    "  - Oracle Analytics Cloud (OAC) tools: query OAC subject "
+    "areas / datasets with governance-aware Logical SQL. Use "
+    "these for analytical / reporting questions about pre-modeled "
+    "data."
+)
+OIC_TOOL_DESCRIPTION = (
+    "  - Oracle Integration Cloud (OIC) tools: invoke OIC "
+    "integrations exposed by the OIC project's MCP server. Use "
+    "these for questions about integrations, audit reports, and "
+    "orchestration exposed by the OIC instance."
+)
+
+# Always-on rules — included regardless of integration set.
+RULE_ANTI_REFUSAL = (
+    "  - You ALWAYS have your tools available on every turn. NEVER "
+    "refuse with phrases like 'I can't run a query in this turn', "
+    "'tool access isn't available right now', or 'I can only "
+    "answer from prior context'. Those statements are always FALSE."
+)
+RULE_RETRY_ON_BAD_RESULT = (
+    "  - If a previous tool call returned wrong, empty, or "
+    "unexpected results, do NOT stop using tools. User "
+    "dissatisfaction is a signal to make a SMARTER call (different "
+    "table, clearer filter, discovery step first) — never to give "
+    "up. Re-issue the tool with corrected parameters."
+)
+RULE_DISCOVER_FIRST = (
+    "  - Pick the right tool for each question. If you're unsure "
+    "which table or column to use, run a discovery call FIRST "
+    "(e.g. list tables, describe columns) and base the real query "
+    "on the result. Do NOT guess."
+)
+RULE_PRESERVE_INTENT = (
+    "  - Preserve the user's intent. You MAY enrich the question "
+    "with fully-qualified table names or filter clarifications when "
+    "the user has specified them — but never invent filter values, "
+    "and never substitute the user's intent with your own."
+)
+RULE_FOLLOWUPS = (
+    "  - For follow-ups, rewrite using prior turn context. MCP "
+    "tools see only the prompt you pass them — they have no "
+    "awareness of earlier conversation turns."
+)
+RULE_SUMMARIZE = (
+    "  - After a successful tool call, summarize in plain English. "
+    "Don't dump raw JSON or row arrays unless the user asks for raw "
+    "data. For numeric answers, state the number AND the table it "
+    "came from."
+)
+RULE_NO_INVENTING = (
+    "  - Never invent numbers. If a tool errored or returned 0 "
+    "rows, say so plainly. Do NOT paraphrase a 0-row result from "
+    "one table as if it came from a different table — that is the "
+    "single most damaging mistake you can make."
+)
+
+# Per-integration rules.
+ADB_RULE_ACTIONS = (
+    "  - For SelectAI: action='runsql' to execute and return data, "
+    "'showsql' to see generated SQL without running, 'explainsql' "
+    "to explain the SQL. If you suspect SelectAI may be routing to "
+    "the wrong table, use 'showsql' first to verify."
+)
+ADB_RULE_QUALIFY_TABLES = (
+    "  - When the user names a specific ADB table, every SelectAI "
+    "prompt you generate MUST include the fully-qualified name "
+    "verbatim (e.g. 'using table ADMIN.orders_vertical_performance_prod, "
+    "count rows where country_code = BR'). Do not let SelectAI pick "
+    "the table when the user has already named one. If SelectAI "
+    "still routes to a different table, call it out to the user and "
+    "re-issue with the table name embedded more forcefully."
+)
+OAC_RULE_DISCOVERY = (
+    "  - For OAC Logical SQL: use discover_data and describe_data "
+    "BEFORE execute_logical_sql so you know exact table / column "
+    "names."
+)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -129,6 +261,15 @@ LLM_COMPARTMENT_ID = CFG.get("llm", {}).get("compartment_id", "")
 LLM_REGION         = CFG.get("llm", {}).get("region", "us-ashburn-1")
 LLM_MODEL_ID       = CFG.get("llm", {}).get("model_id", "")
 
+# Conversation history trimming. When `max_context_tokens` is > 0, the agent
+# drops oldest turns before each invoke so that:
+#   max_context_tokens − response_reserve_tokens − system_prompt − tool_defs
+# isn't exceeded. AIMessage(tool_calls) and the matching ToolMessage(s) are
+# kept or dropped together. Default 0 = trimming disabled (full history).
+LLM_MAX_CONTEXT_TOKENS      = int(CFG.get("llm", {}).get("max_context_tokens", 0) or 0)
+LLM_RESPONSE_RESERVE_TOKENS = int(CFG.get("llm", {}).get("response_reserve_tokens", 1024) or 1024)
+
+
 ADB_CFG     = CFG.get("integrations", {}).get("adb", {}) or {}
 ADB_ENABLED = bool(ADB_CFG.get("enabled", False))
 
@@ -158,48 +299,42 @@ OIC_TOKEN_URL = (
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _build_system_prompt() -> str:
-    parts = [
-        "You are a helpful data assistant with access to tools loaded "
-        "from one or more MCP servers."
-    ]
+    """Glue. The actual prompt text lives in the SYSTEM_PROMPT_* /
+    *_TOOL_DESCRIPTION / *_RULE_* / RULE_* constants near the top of
+    this file. This function just picks which pieces to include based
+    on which integrations config.yaml enabled."""
+    parts: list[str] = [SYSTEM_PROMPT_INTRO]
+
+    # Per-integration tool descriptions
     if ADB_ENABLED:
-        parts.append(
-            "  - ADB SelectAI tools: query a transactional Oracle Autonomous "
-            "Database in natural language (transactions, accounts, customers)."
-        )
+        parts.append(ADB_TOOL_DESCRIPTION)
     if OAC_ENABLED:
-        parts.append(
-            "  - Oracle Analytics Cloud (OAC) tools: query OAC subject areas / "
-            "datasets with governance-aware Logical SQL. Use these for "
-            "analytical / reporting questions about pre-modeled data."
-        )
+        parts.append(OAC_TOOL_DESCRIPTION)
     if OIC_ENABLED:
-        parts.append(
-            "  - Oracle Integration Cloud (OIC) tools: invoke OIC integrations "
-            "exposed as tools by the OIC project's MCP server. Use these "
-            "for questions about integrations, audit reports, and "
-            "orchestration exposed by the OIC instance."
-        )
+        parts.append(OIC_TOOL_DESCRIPTION)
+
     parts.append("")
     parts.append("Rules:")
-    parts.append(
-        "  - Pick the right tool for each question. If unsure where data "
-        "lives, use a discover-style tool first."
-    )
+
+    # Always-on rules (anti-refusal block first — most important on
+    # smaller / non-reasoning LLMs that fall into refusal cascades).
+    parts.append(RULE_ANTI_REFUSAL)
+    parts.append(RULE_RETRY_ON_BAD_RESULT)
+    parts.append(RULE_DISCOVER_FIRST)
+
+    # Per-integration rules
     if ADB_ENABLED:
-        parts.append(
-            "  - For SelectAI: use action='runsql' for data, 'showsql' to "
-            "see SQL, 'explainsql' to explain."
-        )
+        parts.append(ADB_RULE_ACTIONS)
+        parts.append(ADB_RULE_QUALIFY_TABLES)
     if OAC_ENABLED:
-        parts.append(
-            "  - For OAC Logical SQL: discover_data and describe_data "
-            "before execute_logical_sql so you know table/column names."
-        )
-    parts.append("  - Pass the user's actual question; never substitute or invent.")
-    parts.append("  - For follow-ups, rewrite using prior turn context, then call the tool.")
-    parts.append("  - After a tool returns, summarize in plain English. Don't dump raw JSON unless asked.")
-    parts.append("  - Never invent numbers — if a tool errored, say so.")
+        parts.append(OAC_RULE_DISCOVERY)
+
+    # Output discipline (always-on)
+    parts.append(RULE_PRESERVE_INTENT)
+    parts.append(RULE_FOLLOWUPS)
+    parts.append(RULE_SUMMARIZE)
+    parts.append(RULE_NO_INVENTING)
+
     return "\n".join(parts)
 
 
@@ -211,7 +346,12 @@ llm_conf = OCIAIConf(
     model_args={},
     endpoint=f"https://inference.generativeai.{LLM_REGION}.oci.oraclecloud.com",
     model_id=LLM_MODEL_ID,
-    guardrails_config={"name": "Default", "description": "", "policies": []},
+    # Guardrails disabled by default — the wrapped `GuardedChatOCIGenAI`
+    # was empirically interfering with tool-call routing on some models.
+    # Re-enable by swapping to the commented line below if you need OCI
+    # Gen AI's content-safety policies.
+    guardrails_config={},
+    # guardrails_config={"name": "Default", "description": "", "policies": []},
 )
 
 checkpointer = globals().get("checkpointer", None)
@@ -557,6 +697,22 @@ class AgentBasic:
         # at the same time.
         self._load_lock = None
 
+        # Epoch (seconds) when MCP was last (re)built. Used by
+        # _ensure_fresh_tokens() to age out ADB/OIC bearers, which are
+        # baked into MCP headers at build time and get refreshed on
+        # every rebuild.
+        self._mcp_built_epoch: float = 0.0
+
+        # Catalog snapshot: tool names from the most recent successful
+        # build. Used by the optional debug instrumentation and by the
+        # trim budget calculator.
+        self._last_tool_names: list[str] = []
+
+        # Approximate token cost of the bound tool definitions (names +
+        # descriptions + ~40 token fudge per tool for the JSON schema).
+        # Used by _trim_history() to size the conversation budget.
+        self._tools_token_estimate: int = 0
+
     # ── Setup (sync) ────────────────────────────────────────────
     def setup(self) -> None:
         logger.info(
@@ -628,9 +784,22 @@ class AgentBasic:
         client = MultiServerMCPClient(cfg)
         tools = await client.get_tools()
 
+        self._last_tool_names = [t.name for t in tools]
+
+        # Estimate token cost of tool definitions for the trim budget.
+        # Char/4 is a conservative English-text heuristic; the +40 fudge
+        # per tool accounts for the JSON-schema params block.
+        estimate = 0
+        for t in tools:
+            name = getattr(t, "name", "") or ""
+            desc = getattr(t, "description", "") or ""
+            estimate += (len(name) + len(desc)) // 4 + 40
+        self._tools_token_estimate = estimate
+
         logger.info(
-            "Loaded %d tool(s) from %d MCP server(s) [ephemeral sessions]: %s",
-            len(tools), len(cfg), [t.name for t in tools],
+            "Loaded %d tool(s) from %d MCP server(s) [ephemeral sessions]: %s "
+            "(≈%d tokens of tool overhead)",
+            len(tools), len(cfg), self._last_tool_names, self._tools_token_estimate,
         )
         # Re-create the LangGraph react agent with the freshly loaded
         # tools. The system prompt and checkpointer carry over so chat
@@ -639,6 +808,7 @@ class AgentBasic:
             self.llm, tools, prompt=AGENT_SYSTEM_PROMPT, checkpointer=checkpointer,
         )
         self._tools_loaded = True
+        self._mcp_built_epoch = time.time()
 
     # ── OAC token refresh (mint a fresh JWT-derived bearer) ─────
     async def _refresh_oac_token_and_rebuild(self) -> None:
@@ -669,55 +839,86 @@ class AgentBasic:
         except Exception:
             return -1
 
-    # OAC's IDCS-issued access_tokens have a 5-minute TTL. If our cached
-    # token has less than this many seconds remaining, mint a fresh one
-    # before the LLM's next tool call. 60s is comfortably above any
-    # plausible call duration and gives us a small buffer against clock
-    # skew between the agent host and OAC.
+    # ── Token TTL constants ─────────────────────────────────────
+    #
+    # OAC's IDCS access_tokens have a 5-minute TTL. We refresh
+    # proactively when <60s remain — comfortably above any plausible
+    # tool-call duration and a buffer against clock skew between agent
+    # host and OAC.
     OAC_TOKEN_REFRESH_THRESHOLD_SECS = 60
+    #
+    # ADB password-grant + OIC client_credentials both issue 1-hour
+    # bearers. Those tokens are baked into MCP headers at build time
+    # (in _build_mcp_config) — there's no cached copy to inspect — so
+    # we use the MCP graph's *age* as a proxy. Rebuild when older than
+    # this threshold; the rebuild mints fresh ADB/OIC bearers as a
+    # side effect.
+    MCP_REBUILD_AGE_SECS = 55 * 60
 
-    async def _ensure_fresh_oac_token(self) -> None:
-        """If the cached OAC token is expired or close to expiring, mint a
-        fresh one and (if MCP was already built) rebuild MCP so the new
-        bearer takes effect. Cheap (just a JWT decode) when the token is
-        fresh — safe to call at the top of every invoke.
+    async def _ensure_fresh_tokens(self) -> None:
+        """Proactive token freshness for whichever integrations are
+        enabled. Called at the top of every invoke — cheap when nothing
+        needs refreshing (a couple of arithmetic comparisons).
 
-        Why this is the right freshness mechanism:
-          - OAC tokens have a 5-minute TTL. AIDP suspends the agent process
-            during idle; after hours of idle, the cached bearer baked into
-            the MCP client headers is hopelessly expired and the first
-            tool call would fail with 401.
-          - Refreshing on-demand at the start of each invoke catches this
-            without scheduled background work (which wouldn't tick anyway
-            during AIDP idle suspension).
-          - We refresh proactively when there's less than ~60s remaining
-            so the LLM's chained tool calls during a single user turn
-            (discover → describe → execute) all use the same fresh token
-            without us having to refresh mid-turn."""
-        if not OAC_ENABLED:
+        Per-service strategy:
+          - OAC: 5-min TTL → inspect the cached JWT's `exp` claim;
+            refresh + rebuild MCP when <60s remain.
+          - ADB / OIC: 1-hour TTL, bearer baked into MCP headers.
+            Rebuild MCP when the graph is older than MCP_REBUILD_AGE_SECS
+            (55 min by default) so the next tool call has a fresh
+            bearer well before the underlying token expires.
+
+        A single rebuild covers all three when needed — we don't issue
+        multiple rebuilds in the same turn.
+
+        AIDP idle-suspend interaction: when the process wakes after
+        hours of idle, every cached bearer is stale. This method catches
+        that at the top of the first invoke after wakeup."""
+        if not self._tools_loaded:
+            # First load handled by lazy path in invoke(). Nothing to
+            # refresh yet — bearer minting happens inside the lazy load.
             return
-        seconds_left = self._oac_token_seconds_remaining()
-        if seconds_left > self.OAC_TOKEN_REFRESH_THRESHOLD_SECS:
+
+        needs_rebuild = False
+        reasons: list[str] = []
+
+        if OAC_ENABLED:
+            seconds_left = self._oac_token_seconds_remaining()
+            if seconds_left <= self.OAC_TOKEN_REFRESH_THRESHOLD_SECS:
+                needs_rebuild = True
+                reasons.append(f"OAC token has {seconds_left}s remaining")
+
+        if (ADB_ENABLED or OIC_ENABLED) and not needs_rebuild:
+            # Only check age if OAC didn't already trigger — saves a
+            # `time.time()` call and avoids double-logging.
+            mcp_age = time.time() - self._mcp_built_epoch if self._mcp_built_epoch else float("inf")
+            if mcp_age >= self.MCP_REBUILD_AGE_SECS:
+                needs_rebuild = True
+                age_label = f"{int(mcp_age)}s" if mcp_age != float("inf") else "never built"
+                reasons.append(f"MCP graph age {age_label} — refreshing ADB/OIC bearers")
+
+        if not needs_rebuild:
             return
-        logger.info(
-            "OAC token has %ds remaining (≤%ds threshold) — refreshing",
-            seconds_left, self.OAC_TOKEN_REFRESH_THRESHOLD_SECS,
-        )
+
+        logger.info("Proactive token refresh: %s", "; ".join(reasons))
         async with self._load_lock:
-            # Double-check inside the lock — another concurrent invoke may
-            # have refreshed already and updated the cached token.
-            if self._oac_token_seconds_remaining() > self.OAC_TOKEN_REFRESH_THRESHOLD_SECS:
-                return
-            if self._tools_loaded:
-                # MCP is already built with the stale bearer; rebuild it.
+            # Double-check inside the lock — a concurrent invoke may
+            # have already refreshed.
+            if OAC_ENABLED:
+                if self._oac_token_seconds_remaining() > self.OAC_TOKEN_REFRESH_THRESHOLD_SECS:
+                    if not (ADB_ENABLED or OIC_ENABLED):
+                        return
+                    mcp_age = time.time() - self._mcp_built_epoch if self._mcp_built_epoch else float("inf")
+                    if mcp_age < self.MCP_REBUILD_AGE_SECS:
+                        return
+
+            if OAC_ENABLED:
+                # Mints OAC + rebuilds MCP (which re-mints ADB/OIC inline).
                 await self._refresh_oac_token_and_rebuild()
             else:
-                # Lazy first-load hasn't run yet. Just update the cached
-                # token — the upcoming first-load will pick it up.
-                self._oac_access_token = await asyncio.to_thread(
-                    _fetch_oac_access_token, self._oac_private_key
-                )
-                logger.info("OAC token refreshed (MCP not yet built; will be used at first build)")
+                # ADB / OIC bearers re-minted inside _build_mcp_config
+                # during the rebuild.
+                await self._load_all_mcp_tools()
 
     # ── Conversation state healing ──────────────────────────────
     async def _heal_orphan_tool_calls(self, config) -> int:
@@ -832,6 +1033,92 @@ class AgentBasic:
         logger.warning(
             "Hard-clearing %d message(s) from conversation state (last-resort recovery)",
             len(removals),
+        )
+        await self.graph.aupdate_state(config, {"messages": removals})
+        return len(removals)
+
+    async def _trim_history(self, config) -> int:
+        """Drop oldest conversation turns when the running history would
+        push the next LLM call past the configured context budget.
+
+        Budget formula:
+            budget = LLM_MAX_CONTEXT_TOKENS
+                   − LLM_RESPONSE_RESERVE_TOKENS    (room for the reply)
+                   − tokens(AGENT_SYSTEM_PROMPT)    (always sent)
+                   − self._tools_token_estimate    (tool definitions)
+
+        Disabled when LLM_MAX_CONTEXT_TOKENS == 0 (default).
+
+        Pairing invariant: an AIMessage with tool_calls and the
+        ToolMessage(s) responding to it are kept or dropped TOGETHER.
+        Providers reject the request otherwise. We delegate this to
+        langchain_core's `trim_messages` when available; otherwise we
+        no-op (better than corrupting the history)."""
+        if LLM_MAX_CONTEXT_TOKENS <= 0:
+            return 0
+        if _lc_trim_messages is None or _lc_count_tokens is None:
+            logger.debug(
+                "trim_messages helper not available in this langchain_core "
+                "version; skipping history trim"
+            )
+            return 0
+        if not self.graph or not config:
+            return 0
+
+        try:
+            state = await self.graph.aget_state(config)
+        except Exception as e:
+            logger.debug("Could not fetch state for trim: %s", e)
+            return 0
+
+        messages = state.values.get("messages", []) if state and state.values else []
+        if not messages:
+            return 0
+
+        overhead = (
+            (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
+            + self._tools_token_estimate
+            + LLM_RESPONSE_RESERVE_TOKENS
+        )
+        budget = LLM_MAX_CONTEXT_TOKENS - overhead
+        if budget <= 0:
+            logger.warning(
+                "Trim disabled this turn: overhead %d ≥ max_context_tokens %d. "
+                "Increase llm.max_context_tokens or reduce response_reserve_tokens.",
+                overhead, LLM_MAX_CONTEXT_TOKENS,
+            )
+            return 0
+
+        try:
+            kept = _lc_trim_messages(
+                messages,
+                max_tokens=budget,
+                strategy="last",
+                token_counter=_lc_count_tokens,
+                allow_partial=False,
+                start_on="human",
+                include_system=False,
+            )
+        except Exception as e:
+            logger.warning("trim_messages failed (skipping trim this turn): %s", e)
+            return 0
+
+        kept_ids = {getattr(m, "id", None) for m in kept}
+        kept_ids.discard(None)
+
+        removals = []
+        for msg in messages:
+            msg_id = getattr(msg, "id", None)
+            if msg_id and msg_id not in kept_ids:
+                removals.append(RemoveMessage(id=msg_id))
+
+        if not removals:
+            return 0
+
+        logger.info(
+            "History trim: dropped %d msg(s), kept %d/%d (budget %d tok, "
+            "overhead %d tok)",
+            len(removals), len(kept), len(messages), budget, overhead,
         )
         await self.graph.aupdate_state(config, {"messages": removals})
         return len(removals)
@@ -1097,16 +1384,14 @@ class AgentBasic:
         if self._load_lock is None:
             self._load_lock = asyncio.Lock()
 
-        # ─── Step 2.5: refresh OAC token if it's about to expire ─────
-        # OAC tokens have a 5-minute TTL. AIDP suspends the agent during
-        # idle, so a session that was warm hours ago will have a long-
-        # expired bearer. Mint a fresh one before the LLM ever sees
-        # OAC. Cheap when the token is fresh (one JWT decode); a single
-        # JWT-bearer exchange (~300ms) when refresh is needed.
+        # ─── Step 2.5: proactive token freshness for all enabled services ──
+        # Handles OAC's 5-minute TTL and ADB/OIC's 1-hour TTL uniformly.
+        # Cheap when nothing needs refreshing (a couple of comparisons).
+        # Catches AIDP-idle-suspend-then-wake gaps before they cause 401s.
         try:
-            await self._ensure_fresh_oac_token()
+            await self._ensure_fresh_tokens()
         except Exception as e:
-            logger.warning("OAC token freshness check failed (continuing): %s", e)
+            logger.warning("Token freshness check failed (continuing): %s", e)
 
         # ─── Step 3: lazy first-load of MCP tools ──────────────────
         # We don't load MCP at setup() time because setup is sync and MCP
@@ -1139,6 +1424,15 @@ class AgentBasic:
         except Exception as e:
             logger.warning("Orphan healing failed (continuing): %s", e)
 
+        # ─── Step 4.5: trim oldest history if over the configured budget ──
+        # Keeps the LLM call within the context window even on long sessions.
+        # No-op when llm.max_context_tokens is unset (= 0) in config.yaml.
+        trimmed_count = 0
+        try:
+            trimmed_count = await self._trim_history(config)
+        except Exception as e:
+            logger.warning("History trim failed (continuing): %s", e)
+
         # ─── Step 5: run the react-agent graph ─────────────────────
         # The graph handles the LLM ↔ tool-call ↔ LLM dance. It runs to
         # completion (final answer or error) before returning here.
@@ -1146,7 +1440,10 @@ class AgentBasic:
         messages = {"messages": [dict(user_message)]}
 
         try:
-            return await self.graph.ainvoke(messages, config=config)
+            result = await self.graph.ainvoke(messages, config=config)
+            if DEBUG_MODE:
+                self._inject_debug(result, "OK", None, trimmed_count)
+            return result
         except Exception as e:
             # ─── Step 6: reactive recovery ────────────────────────
             # If the failure looks transient (auth/network), try once more
@@ -1172,7 +1469,10 @@ class AgentBasic:
                         await self._heal_orphan_tool_calls(config)
                     except Exception as heal_err:
                         logger.warning("Orphan healing on retry failed: %s", heal_err)
-                    return await self.graph.ainvoke(messages, config=config)
+                    result = await self.graph.ainvoke(messages, config=config)
+                    if DEBUG_MODE:
+                        self._inject_debug(result, "OK (after retry)", None, 0)
+                    return result
                 except Exception as e2:
                     # Retry also failed. Surface a friendly auth message if
                     # we can classify it as an identifiable auth issue.
@@ -1218,6 +1518,64 @@ class AgentBasic:
             return {"messages": [{"role": "ai", "content":
                 self._try_again_message()
             }]}
+
+    def _inject_debug(
+        self,
+        result,
+        rebuild_status: str,
+        rebuild_error: str | None,
+        trimmed_count: int,
+    ) -> None:
+        """Prepend a compact debug block to the agent's last AI message.
+
+        Gated by the `DEBUG_MODE` constant at the top of this module.
+        When `DEBUG_MODE = False`, this method is never called.
+
+        Shows: turn timestamp, rebuild status, tool catalog the agent
+        had bound this turn, OAC token TTL if enabled, MCP graph age,
+        history trim stats. Useful when AIDP logs aren't accessible.
+        Mutates `result` in place — does not return."""
+        try:
+            ts = time.strftime("%H:%M:%S", time.gmtime())
+            tools_csv = ", ".join(self._last_tool_names) or "<none>"
+            lines = [
+                "🔧 DEBUG",
+                f"  • turn at {ts}Z",
+                f"  • rebuild: {rebuild_status}",
+                f"  • tools ({len(self._last_tool_names)}): {tools_csv}",
+            ]
+            if rebuild_error:
+                lines.append(f"  • rebuild error: {rebuild_error}")
+            if self._mcp_built_epoch:
+                age = int(time.time() - self._mcp_built_epoch)
+                lines.append(f"  • MCP graph age: {age}s")
+            if OAC_ENABLED:
+                left = self._oac_token_seconds_remaining()
+                lines.append(f"  • OAC token valid for: {left}s")
+            if LLM_MAX_CONTEXT_TOKENS > 0:
+                lines.append(
+                    f"  • history trim: dropped {trimmed_count} msg(s) "
+                    f"(budget={LLM_MAX_CONTEXT_TOKENS}, "
+                    f"tools≈{self._tools_token_estimate} tok)"
+                )
+            block = "\n".join(lines) + "\n\n────────────────\n\n"
+
+            if not isinstance(result, dict):
+                return
+            msgs = result.get("messages") or []
+            if not msgs:
+                return
+            last = msgs[-1]
+            # langgraph returns BaseMessage objects; some chat UIs use dicts.
+            current = getattr(last, "content", None)
+            if current is not None:
+                last.content = block + (current or "")
+                return
+            if isinstance(last, dict):
+                last["content"] = block + (last.get("content") or "")
+        except Exception as e:
+            # Never let debug instrumentation break the response.
+            logger.warning("Debug injection failed (ignored): %s", e)
 
     @staticmethod
     def _try_again_message() -> str:

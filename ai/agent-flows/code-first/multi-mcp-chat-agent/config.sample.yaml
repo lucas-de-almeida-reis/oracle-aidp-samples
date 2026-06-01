@@ -19,6 +19,26 @@ llm:
   region: us-ashburn-1
   model_id: xai.grok-4-fast-non-reasoning
 
+  # Optional: cap the conversation history sent to the LLM on each turn.
+  # When max_context_tokens is > 0, the agent drops oldest turns (keeping
+  # tool_call / ToolMessage pairs intact) until the running history fits:
+  #
+  #   max_context_tokens − response_reserve_tokens − system_prompt − tool_defs
+  #
+  # Set to your chosen model's context window (or a fraction of it). Leave
+  # at 0 / omit to disable trimming entirely (full history every turn —
+  # the original behavior). The model still grows context until the
+  # provider rejects the request; this knob keeps long sessions stable.
+  #
+  # response_reserve_tokens is the headroom kept for the model's reply.
+  max_context_tokens: 0
+  response_reserve_tokens: 1024
+
+
+# Debug instrumentation is controlled by the `DEBUG_MODE` constant at
+# the top of agent.py (not via config.yaml). Set it to True to surface
+# a runtime diagnostic block in every chat reply.
+
 
 integrations:
 
