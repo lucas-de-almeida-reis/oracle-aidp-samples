@@ -69,6 +69,50 @@ logger = logging.getLogger(__name__)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
+# ║   MAX_TURNS_KEPT — hard cap on conversation history          ║
+# ║                                                              ║
+# ║   When > 0, the agent keeps only the last N user-message     ║
+# ║   turns in conversation state before each LLM call. Anything ║
+# ║   older is removed (AIMessage(tool_calls)+ToolMessage pairs  ║
+# ║   stay together — the cut is always at a HumanMessage        ║
+# ║   boundary).                                                 ║
+# ║                                                              ║
+# ║   Set to 0 to disable; subject to the token-budget trim      ║
+# ║   alone (or no trim at all).                                 ║
+# ║                                                              ║
+# ║   Why this exists: even with a correct token budget, the     ║
+# ║   model's tool-use reliability degrades after extensive      ║
+# ║   tool-calling history (long-context laziness, compounded    ║
+# ║   by upstream tool-schema flattening in OCI's generic        ║
+# ║   provider). A hard turn cap is a deterministic workaround   ║
+# ║   independent of any provider-side limit.                    ║
+# ╚══════════════════════════════════════════════════════════════╝
+MAX_TURNS_KEPT = 0
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   NEXT_HUMAN_SLACK_TOKENS — budget headroom for the upcoming ║
+# ║   user message                                               ║
+# ║                                                              ║
+# ║   When _trim_history computes how much history fits in the   ║
+# ║   token budget for this turn, the next HumanMessage hasn't   ║
+# ║   been added to state yet — it'll be appended right after    ║
+# ║   trim, just before the LLM call. So we reserve room for it. ║
+# ║                                                              ║
+# ║   200 tokens is sized for typical conversational input       ║
+# ║   ("now drill down by …", "and for AR?", short SQL). If the  ║
+# ║   agent is used in a domain where users paste large inputs   ║
+# ║   (full documents, long SQL, JSON blobs), raise this to      ║
+# ║   avoid trimming so loose that the new turn pushes the       ║
+# ║   prompt past the model's window.                            ║
+# ║                                                              ║
+# ║   Sized in tokens — count_tokens_approximately uses ~4 chars ║
+# ║   per token for Latin scripts, so 200 ≈ 800 chars of input.  ║
+# ╚══════════════════════════════════════════════════════════════╝
+NEXT_HUMAN_SLACK_TOKENS = 200
+
+
+# ╔══════════════════════════════════════════════════════════════╗
 # ║   System-prompt strings — edit here to tune agent behavior   ║
 # ║                                                              ║
 # ║   _build_system_prompt() further down assembles these based  ║
@@ -240,11 +284,26 @@ LLM_COMPARTMENT_ID = CFG.get("llm", {}).get("compartment_id", "")
 LLM_REGION         = CFG.get("llm", {}).get("region", "us-ashburn-1")
 LLM_MODEL_ID       = CFG.get("llm", {}).get("model_id", "")
 
-# Conversation history trimming. When `max_context_tokens` is > 0, the agent
-# drops oldest turns before each invoke so that:
-#   max_context_tokens − response_reserve_tokens − system_prompt − tool_defs
-# isn't exceeded. AIMessage(tool_calls) and the matching ToolMessage(s) are
-# kept or dropped together. Default 0 = trimming disabled (full history).
+# Conversation history trimming — two independent knobs, both default off.
+#
+# Convention: a value of 0 means the knob is DISABLED, not "zero tokens
+# allowed". The corresponding trim path becomes a no-op for that turn.
+# Treat 0 as "leave it alone" rather than a real ceiling.
+#
+# `max_turns` (preferred when set): cap conversation history to the last N
+# user turns regardless of token size. Simple, deterministic, customer-
+# friendly. Set this when you want a hard ceiling and don't want to think
+# about token math.
+#
+# `max_context_tokens`: cap by token count. The agent drops oldest turns so
+# `max_context_tokens − response_reserve_tokens − system_prompt − tool_defs`
+# isn't exceeded. Use this when conversation length varies wildly with tool
+# response sizes and you want a budget-based ceiling instead.
+#
+# Both can be set at once; whichever cuts more aggressively wins on a given
+# turn. AIMessage(tool_calls) and the matching ToolMessage(s) are kept or
+# dropped together in both modes.
+LLM_MAX_TURNS               = int(CFG.get("llm", {}).get("max_turns", 0) or 0)
 LLM_MAX_CONTEXT_TOKENS      = int(CFG.get("llm", {}).get("max_context_tokens", 0) or 0)
 LLM_RESPONSE_RESERVE_TOKENS = int(CFG.get("llm", {}).get("response_reserve_tokens", 1024) or 1024)
 
@@ -595,6 +654,46 @@ def _is_invalid_history(e: BaseException) -> bool:
     )
 
 
+def _is_context_overflow_error(e: BaseException) -> bool:
+    """True when the exception text looks like a model context-window /
+    prompt token-limit error.
+
+    OCI Gen AI surfaces these as 400 Bad Request with messages like:
+      • 'maximum context length is X tokens'
+      • 'token limit exceeded'
+      • 'prompt_tokens (N) exceeds the maximum'
+      • 'input is too long'
+
+    Recovery (handled in invoke()): drop the latest turn from state — that
+    turn is almost certainly the culprit, typically because a tool returned
+    a huge response that ballooned the prompt for the next LLM round. Much
+    less destructive than _hard_clear_history.
+
+    We do NOT auto-retry the same query after the clear — the user needs
+    to reformulate, otherwise the next call would hit the same overflow.
+
+    The string match is intentionally broad: false positives just trigger
+    an unneeded last-turn clear (cheap), false negatives leave the agent
+    stuck in a no-progress loop (expensive)."""
+    sub_exceptions = getattr(e, "exceptions", None)
+    if sub_exceptions:
+        return any(_is_context_overflow_error(sub) for sub in sub_exceptions)
+    msg = str(e).lower()
+    return any(s in msg for s in (
+        "maximum context length",
+        "max context length",
+        "context_length_exceeded",
+        "context length exceeded",
+        "token limit exceeded",
+        "exceeds the maximum",
+        "input is too long",
+        "prompt is too long",
+        "request too large",
+        "too many tokens",
+        "context window",
+    ))
+
+
 def _is_recoverable_error(e: BaseException) -> bool:
     """Decide whether a failed invoke is worth retrying after rebuilding
     the MCP stack. We retry on:
@@ -686,8 +785,44 @@ class AgentBasic:
 
         # Approximate token cost of the bound tool definitions (names +
         # descriptions + ~40 token fudge per tool for the JSON schema).
-        # Used by _trim_history() to size the conversation budget.
+        # Used by _trim_history() to size the conversation budget on the
+        # very first turn, before we have a real measurement from OCI.
         self._tools_token_estimate: int = 0
+
+        # Ground-truth signals captured from the previous successful invoke.
+        # `_last_prompt_tokens` is the request size OCI reports in
+        # `response.usage.prompt_tokens`. `_measured_overhead_tokens` is the
+        # derived system+tools cost (prompt_tokens − tokens(history we sent)).
+        # _trim_history prefers these over the heuristic above whenever they
+        # are populated — the heuristic chronically under-counts complex
+        # JSON schemas, which made trim fire too late and let single turns
+        # degrade before the budget rebalanced. Both are None until the
+        # first invoke completes.
+        self._last_prompt_tokens: int | None = None
+        self._measured_overhead_tokens: int | None = None
+
+        # Set by _trim_history when it detects that the budget is so tight
+        # that it cannot preserve a usable window of history — i.e. the
+        # most recent tool response alone exceeds the trim budget, so the
+        # trim would have to drop EVERYTHING to fit.
+        #
+        # Why a flag instead of a return value: _trim_history's existing
+        # callers (invoke step 4.5) ignore its int return. Hooking
+        # behaviour to the return value would require touching three
+        # call sites and lying about its semantics. The flag is simpler:
+        # set during trim, checked once in invoke after step 4.5, reset
+        # at the top of each invoke so it never persists across turns.
+        #
+        # When set: invoke skips the LLM call entirely (it would only
+        # produce a confused / amnesic response with the gutted history),
+        # runs _clear_last_turn to surgically remove the offending turn,
+        # and returns _context_overflow_message to the user.
+        #
+        # This closes the gap left by the exception-based overflow
+        # handler — which can't see this case because OCI never errors:
+        # the trim silently obliterates context and OCI happily processes
+        # the resulting tiny prompt.
+        self._trim_dropped_critical_context: bool = False
 
         # Outcome of the last _hard_clear_history attempt. Set to
         # "one-at-a-time (N/M removed)", "no removable ids", or
@@ -770,11 +905,30 @@ class AgentBasic:
         self._last_tool_names = [t.name for t in tools]
 
         # Estimate token cost of tool definitions for the trim budget.
+        # The serialized FunctionDefinition that OCI Gen AI receives is
+        # 3-10x larger than name + description alone — the JSON schema
+        # of args dominates the size. Under-counting makes _trim_history
+        # think it has budget that doesn't exist, history grows past the
+        # model's reliable tool-use zone, and tool-calling silently
+        # degrades.
         estimate = 0
         for t in tools:
             name = getattr(t, "name", "") or ""
             desc = getattr(t, "description", "") or ""
-            estimate += (len(name) + len(desc)) // 4 + 40
+            schema_json = ""
+            schema = getattr(t, "args_schema", None)
+            if schema is not None:
+                if hasattr(schema, "model_json_schema"):
+                    try:
+                        schema_json = json.dumps(schema.model_json_schema())
+                    except Exception:
+                        pass
+                elif hasattr(schema, "schema"):
+                    try:
+                        schema_json = json.dumps(schema.schema())
+                    except Exception:
+                        pass
+            estimate += (len(name) + len(desc) + len(schema_json)) // 4 + 20
         self._tools_token_estimate = estimate
 
         logger.info(
@@ -1132,15 +1286,237 @@ class AgentBasic:
         )
         return 0
 
+    async def _clear_last_turn(self, config) -> int:
+        """Remove the most recent conversation turn from state.
+
+        A "turn" = from the most recent HumanMessage (inclusive) onward.
+        That covers the user message, any AIMessages with tool_calls
+        emitted during that turn, and any ToolMessages from the tool
+        executions. Earlier conversation context is left intact.
+
+        Used by invoke()'s context-overflow recovery: when a single turn
+        blew past the model's window (typically a giant tool response),
+        scrubbing just that turn is much less destructive than
+        _hard_clear_history. The user loses only the specific query that
+        overflowed and can reformulate against the same context.
+
+        Returns the count of messages actually removed. 0 means we
+        couldn't find a HumanMessage to anchor on, or the matching
+        messages had no .id we could target."""
+        if not self.graph or not config:
+            return 0
+        state_cfg = self._state_config(config)
+        try:
+            state = await self.graph.aget_state(state_cfg)
+        except Exception as e:
+            logger.debug("Could not fetch state for last-turn clear: %s", e)
+            return 0
+
+        messages = state.values.get("messages", []) if state and state.values else []
+        if not messages:
+            return 0
+
+        # Walk backwards to find the most recent HumanMessage. Everything
+        # from there to the end is "the last turn".
+        cut_idx: int | None = None
+        for i in range(len(messages) - 1, -1, -1):
+            if self._msg_type(messages[i]).lower() in ("human", "humanmessage"):
+                cut_idx = i
+                break
+
+        if cut_idx is None:
+            return 0  # no HumanMessage in state — nothing safe to anchor on
+
+        removals = []
+        for msg in messages[cut_idx:]:
+            msg_id = self._msg_id(msg)
+            if msg_id:
+                removals.append(RemoveMessage(id=msg_id))
+
+        if not removals:
+            logger.warning(
+                "Last-turn clear: %d msg(s) in the last turn but NONE had an "
+                "id field — cannot remove.",
+                len(messages) - cut_idx,
+            )
+            return 0
+
+        # Issue removals one-at-a-time for the same checkpointer-safety
+        # reason _hard_clear_history does.
+        succeeded = 0
+        for r in removals:
+            try:
+                await self.graph.aupdate_state(state_cfg, {"messages": [r]})
+                succeeded += 1
+            except Exception as e:
+                logger.debug("Last-turn remove failed for one msg: %s", e)
+
+        logger.warning(
+            "Last-turn clear: removed %d/%d msg(s) from the most recent turn "
+            "(cut at index %d of %d total).",
+            succeeded, len(removals), cut_idx, len(messages),
+        )
+        return succeeded
+
+    async def _trim_history_by_turns(self, config) -> int:
+        """Hard cap on conversation history by user-turn count.
+
+        Walks state messages backwards, finds the (MAX_TURNS_KEPT+1)-th
+        most-recent HumanMessage, and removes everything strictly before
+        the MAX_TURNS_KEPT-th most-recent Human. The cut is always at a
+        HumanMessage boundary so AIMessage(tool_calls) + ToolMessage
+        pairs from a kept turn stay intact.
+
+        No-op when MAX_TURNS_KEPT == 0 or when state contains
+        ≤ MAX_TURNS_KEPT user turns."""
+        if MAX_TURNS_KEPT <= 0:
+            return 0
+        if not self.graph or not config:
+            return 0
+
+        state_cfg = self._state_config(config)
+        try:
+            state = await self.graph.aget_state(state_cfg)
+        except Exception as e:
+            logger.debug("Could not fetch state for turn trim: %s", e)
+            return 0
+
+        messages = state.values.get("messages", []) if state and state.values else []
+        if not messages:
+            return 0
+
+        # Collect indices of the MAX_TURNS_KEPT+1 most-recent Humans
+        # (newest first). If fewer than MAX_TURNS_KEPT+1 exist, no trim.
+        human_positions: list[int] = []
+        for i in range(len(messages) - 1, -1, -1):
+            if self._msg_type(messages[i]).lower() in ("human", "humanmessage"):
+                human_positions.append(i)
+                if len(human_positions) > MAX_TURNS_KEPT:
+                    break
+
+        if len(human_positions) <= MAX_TURNS_KEPT:
+            return 0  # not enough turns to trim
+
+        # human_positions[MAX_TURNS_KEPT - 1] is the oldest Human we keep.
+        # Drop everything strictly before that index.
+        cut_idx = human_positions[MAX_TURNS_KEPT - 1]
+
+        removals = []
+        for msg in messages[:cut_idx]:
+            msg_id = self._msg_id(msg)
+            if msg_id:
+                removals.append(RemoveMessage(id=msg_id))
+
+        if not removals:
+            return 0
+
+        logger.info(
+            "History turn-trim: dropped %d msg(s), kept %d/%d (MAX_TURNS_KEPT=%d)",
+            len(removals), len(messages) - len(removals), len(messages),
+            MAX_TURNS_KEPT,
+        )
+        await self.graph.aupdate_state(state_cfg, {"messages": removals})
+        return len(removals)
+
+    def _capture_usage_from_result(self, result) -> None:
+        """Read OCI's `usage.prompt_tokens` from the latest AIMessage in the
+        graph result and derive the measured system+tools+meta overhead.
+
+        Why: the old _tools_token_estimate heuristic
+        ((name+desc)//4 + 40 per tool) chronically under-counts when MCP
+        tools carry non-trivial JSON-Schema parameters. That made
+        _trim_history fire too late, letting a single turn drift past
+        the model's effective tool-calling window before the next
+        invoke could rebalance. Reading the real number out of the
+        response lets the trim work from ground truth instead.
+
+        Called from invoke() after every successful ainvoke. Best-effort
+        — any failure (missing usage, exotic message shape) just leaves
+        the previous measurement intact, and trim falls back to the
+        heuristic until we get a clean reading."""
+        if _lc_count_tokens is None:
+            return  # langchain_core too old to count tokens locally
+
+        msgs = result.get("messages", []) if isinstance(result, dict) else []
+        if not msgs:
+            return
+
+        # The final AIMessage in `msgs` is the completion we just received;
+        # its `usage.prompt_tokens` reflects the FULL prompt of the last
+        # LLM round (system + tools + everything up to it, but not itself).
+        prompt_tokens: int | None = None
+        for msg in reversed(msgs):
+            meta = (
+                self._msg_get(msg, "response_metadata")
+                or self._msg_get(msg, "additional_kwargs")
+                or {}
+            )
+            if not isinstance(meta, dict):
+                continue
+            usage = meta.get("usage")
+            if usage is None:
+                continue
+            if isinstance(usage, dict):
+                pt = usage.get("prompt_tokens") or usage.get("promptTokens")
+            else:
+                pt = (
+                    getattr(usage, "prompt_tokens", None)
+                    or getattr(usage, "promptTokens", None)
+                )
+            if pt:
+                prompt_tokens = int(pt)
+                break
+
+        if not prompt_tokens:
+            return  # no usage in any message — provider didn't emit it
+
+        # Count tokens of everything we sent (i.e. all messages BEFORE the
+        # completion). prompt_tokens − history_tokens ≈ system + tools.
+        try:
+            history_tokens = _lc_count_tokens(msgs[:-1]) if len(msgs) > 1 else 0
+        except Exception as e:
+            logger.debug("Could not count history tokens: %s", e)
+            return
+
+        measured_overhead = max(0, prompt_tokens - int(history_tokens))
+        # Sanity: a derived overhead > max_context_tokens is nonsense and
+        # would disable trim entirely on the next turn — ignore it.
+        if (
+            LLM_MAX_CONTEXT_TOKENS > 0
+            and measured_overhead >= LLM_MAX_CONTEXT_TOKENS
+        ):
+            logger.warning(
+                "Derived overhead %d ≥ max_context_tokens %d — ignoring "
+                "(likely a usage-parsing bug or huge tool def).",
+                measured_overhead, LLM_MAX_CONTEXT_TOKENS,
+            )
+            return
+
+        self._last_prompt_tokens = prompt_tokens
+        self._measured_overhead_tokens = measured_overhead
+        logger.info(
+            "Captured usage: prompt_tokens=%d, history_tokens=%d, "
+            "measured_overhead=%d",
+            prompt_tokens, history_tokens, measured_overhead,
+        )
+
     async def _trim_history(self, config) -> int:
         """Drop oldest conversation turns when the running history would
         push the next LLM call past the configured context budget.
 
-        Budget formula:
+        Budget formula (preferred — when we have a real measurement from
+        the previous response's `usage.prompt_tokens`):
             budget = LLM_MAX_CONTEXT_TOKENS
                    − LLM_RESPONSE_RESERVE_TOKENS    (room for the reply)
-                   − tokens(AGENT_SYSTEM_PROMPT)    (always sent)
-                   − self._tools_token_estimate    (tool definitions)
+                   − self._measured_overhead_tokens (system + tools, measured)
+                   − ~200 slack for the upcoming HumanMessage
+
+        Budget formula (fallback — first turn only, before we have a
+        measurement):
+            budget = LLM_MAX_CONTEXT_TOKENS
+                   − LLM_RESPONSE_RESERVE_TOKENS
+                   − tokens(AGENT_SYSTEM_PROMPT)
+                   − self._tools_token_estimate
 
         Disabled when LLM_MAX_CONTEXT_TOKENS == 0 (default).
 
@@ -1174,18 +1550,73 @@ class AgentBasic:
         if not messages:
             return 0
 
-        overhead = (
-            (len(AGENT_SYSTEM_PROMPT) // 4 + 1)
-            + self._tools_token_estimate
-            + LLM_RESPONSE_RESERVE_TOKENS
+        # The sliding-window trim uses start_on="human" — every kept window
+        # must anchor on a HumanMessage. If state has no Human at all (e.g.,
+        # right after a critical-context reset that persisted our overflow
+        # AIMessage but no user turn), trim_messages will correctly return
+        # an empty kept set, which would falsely trip the critical-context
+        # detector and surface a confusing "couldn't reset history" message
+        # to the user on what should be a clean turn.
+        #
+        # Skip the trim entirely in that transient state. The upcoming
+        # ainvoke will add the new HumanMessage and the graph will process
+        # it normally; the dangling AIMessage from the prior reset is
+        # benign (it's just a status message the user already saw in chat).
+        has_human = any(
+            self._msg_type(m).lower() in ("human", "humanmessage")
+            for m in messages
         )
+        if not has_human:
+            logger.debug(
+                "Trim skipped: no HumanMessage in state (msgs=%d, likely "
+                "post-reset). Letting ainvoke add the new user turn.",
+                len(messages),
+            )
+            return 0
+
+        # Prefer the measured overhead from the previous successful response;
+        # fall back to the heuristic only when we have no measurement yet
+        # (i.e., the very first turn of this agent's lifetime).
+        # NEXT_HUMAN_SLACK_TOKENS is a module-level constant near the top of
+        # this file — tune it there if users paste large inputs.
+        if self._measured_overhead_tokens is not None:
+            overhead = (
+                self._measured_overhead_tokens
+                + LLM_RESPONSE_RESERVE_TOKENS
+                + NEXT_HUMAN_SLACK_TOKENS
+            )
+            overhead_source = (
+                f"measured(system+tools={self._measured_overhead_tokens},"
+                f" reserve={LLM_RESPONSE_RESERVE_TOKENS},"
+                f" new_msg≈{NEXT_HUMAN_SLACK_TOKENS})"
+            )
+        else:
+            heuristic_prompt = len(AGENT_SYSTEM_PROMPT) // 4 + 1
+            overhead = (
+                heuristic_prompt
+                + self._tools_token_estimate
+                + LLM_RESPONSE_RESERVE_TOKENS
+            )
+            overhead_source = (
+                f"heuristic(prompt≈{heuristic_prompt},"
+                f" tools≈{self._tools_token_estimate},"
+                f" reserve={LLM_RESPONSE_RESERVE_TOKENS})"
+            )
         budget = LLM_MAX_CONTEXT_TOKENS - overhead
         if budget <= 0:
+            # The fixed overhead alone (system + tools + reserve + slack)
+            # already meets/exceeds the configured context window. There
+            # is no room for ANY history — the request would either be
+            # rejected by the provider or processed with an amnesic
+            # context, neither of which is acceptable. Signal invoke() to
+            # short-circuit before the LLM call.
             logger.warning(
-                "Trim disabled this turn: overhead %d ≥ max_context_tokens %d. "
-                "Increase llm.max_context_tokens or reduce response_reserve_tokens.",
-                overhead, LLM_MAX_CONTEXT_TOKENS,
+                "Trim disabled this turn: overhead %d ≥ max_context_tokens %d "
+                "(source=%s). Increase llm.max_context_tokens or reduce "
+                "response_reserve_tokens.",
+                overhead, LLM_MAX_CONTEXT_TOKENS, overhead_source,
             )
+            self._trim_dropped_critical_context = True
             return 0
 
         try:
@@ -1202,6 +1633,28 @@ class AgentBasic:
             logger.warning("trim_messages failed (skipping trim this turn): %s", e)
             return 0
 
+        # Critical-context detector: trim_messages returned no valid window
+        # that fits the budget. Happens when the most recent ToolMessage
+        # (or any single message in the most recent valid slice) is itself
+        # larger than the budget, AND allow_partial=False forbids cutting
+        # it. The conversation would proceed with an empty history — the
+        # model would have no idea what the user is referring to and the
+        # response would be useless ("I can't retrieve...", "not sure
+        # what you mean", etc.) without any provider-side error to catch.
+        #
+        # We hand off to invoke() instead of silently nuking state. invoke
+        # will run _clear_last_turn (which targets the offending turn
+        # specifically) and surface a clear message to the user.
+        if not kept:
+            logger.warning(
+                "Trim found no valid window within budget %d tok "
+                "(source=%s, msgs=%d). Signalling invoke to short-circuit "
+                "with context-overflow recovery.",
+                budget, overhead_source, len(messages),
+            )
+            self._trim_dropped_critical_context = True
+            return 0
+
         kept_ids = {getattr(m, "id", None) for m in kept}
         kept_ids.discard(None)
 
@@ -1216,8 +1669,9 @@ class AgentBasic:
 
         logger.info(
             "History trim: dropped %d msg(s), kept %d/%d (budget %d tok, "
-            "overhead %d tok)",
+            "overhead %d tok, source=%s, last_prompt_tokens=%s)",
             len(removals), len(kept), len(messages), budget, overhead,
+            overhead_source, self._last_prompt_tokens,
         )
         await self.graph.aupdate_state(state_cfg, {"messages": removals})
         return len(removals)
@@ -1563,15 +2017,65 @@ class AgentBasic:
         except Exception as e:
             logger.warning("Orphan healing failed (continuing): %s", e)
 
-        # ─── Step 4.5: trim oldest history if over the configured budget ──
-        # Keeps the LLM call within the context window even on long sessions.
-        # No-op when llm.max_context_tokens is unset (= 0) in config.yaml.
-        # The method populates self._last_trim_* with stats either way, so
-        # the optional DEBUG block can show what happened (or didn't).
+        # ─── Step 4.5: trim history if over budget (turn cap and/or token cap) ──
+        # Two independent mechanisms, both default off:
+        #   • MAX_TURNS_KEPT (constant at top of this file): hard cap by
+        #     user-turn count. Deterministic, customer-friendly.
+        #   • llm.max_context_tokens (config.yaml): cap by token budget.
+        # If both are active, whichever cuts more wins.
+        #
+        # Reset the critical-context flag before each invoke so it never
+        # carries over from a previous turn.
+        self._trim_dropped_critical_context = False
+        try:
+            await self._trim_history_by_turns(config)
+        except Exception as e:
+            logger.warning("Turn-based history trim failed (continuing): %s", e)
         try:
             await self._trim_history(config)
         except Exception as e:
-            logger.warning("History trim failed (continuing): %s", e)
+            logger.warning("Token-based history trim failed (continuing): %s", e)
+
+        # ─── Step 4.6: handle critical-context loss BEFORE the LLM call ─
+        # _trim_history sets this flag when the budget is so tight that
+        # no valid window of history fits — typically because the most
+        # recent tool response is itself larger than the trim budget.
+        #
+        # Proceeding to ainvoke in that state would send a near-empty
+        # prompt to the model, which then responds with "I can't…" /
+        # "not sure what you mean" — a soft failure with NO provider-side
+        # error, invisible to the exception-based overflow handler.
+        #
+        # Surgical recovery: drop the offending turn (it's already in
+        # state as the most recent completed Human→Tool→AI sequence) so
+        # the next user message has clean ground to stand on, then
+        # surface a clear message asking the user to reformulate or
+        # /reset.
+        if self._trim_dropped_critical_context:
+            # Sliding-window recovery (the simplest, most predictable design):
+            # if even ONE complete turn doesn't fit in the configured budget,
+            # we reset the conversation entirely and tell the user. Going
+            # partial (e.g. _clear_last_turn) leaves stranded AIMessages
+            # that the model reads on the next turn and uses to convince
+            # itself that tools are unavailable — a self-reinforcing
+            # "mode collapse" we observed in practice. A clean reset
+            # avoids that pattern: the next turn starts with fresh state,
+            # no poisoning history to anchor on.
+            logger.warning(
+                "Trim signalled critical-context loss — skipping LLM call, "
+                "resetting conversation, and informing the user"
+            )
+            cleared = 0
+            try:
+                cleared = await self._hard_clear_history(config)
+            except Exception as clear_err:
+                logger.error(
+                    "Hard clear failed after trim signal: %s",
+                    clear_err, exc_info=True,
+                )
+            return {"messages": [{"role": "ai", "content":
+                self._context_overflow_message(cleared)
+            }]}
 
         # ─── Step 5: run the react-agent graph ─────────────────────
         # The graph handles the LLM ↔ tool-call ↔ LLM dance. It runs to
@@ -1580,7 +2084,9 @@ class AgentBasic:
         messages = {"messages": [dict(user_message)]}
 
         try:
-            return await self.graph.ainvoke(messages, config=config)
+            result = await self.graph.ainvoke(messages, config=config)
+            self._capture_usage_from_result(result)
+            return result
         except Exception as e:
             # ─── Step 6: reactive recovery ────────────────────────
             # If the failure looks transient (auth/network), try once more
@@ -1606,7 +2112,9 @@ class AgentBasic:
                         await self._heal_orphan_tool_calls(config)
                     except Exception as heal_err:
                         logger.warning("Orphan healing on retry failed: %s", heal_err)
-                    return await self.graph.ainvoke(messages, config=config)
+                    result = await self.graph.ainvoke(messages, config=config)
+                    self._capture_usage_from_result(result)
+                    return result
                 except Exception as e2:
                     # Retry also failed. Surface a friendly auth message if
                     # we can classify it as an identifiable auth issue.
@@ -1623,13 +2131,40 @@ class AgentBasic:
                         )
                         try:
                             await self._hard_clear_history(config)
-                            return await self.graph.ainvoke(messages, config=config)
+                            result = await self.graph.ainvoke(messages, config=config)
+                            self._capture_usage_from_result(result)
+                            return result
                         except Exception as e3:
                             logger.error("Hard-clear retry also failed: %s", e3, exc_info=True)
                     logger.error("Retry after rebuild failed: %s", e2, exc_info=True)
                     return {"messages": [{"role": "ai", "content":
                         self._try_again_message()
                     }]}
+
+            # Context-overflow caught directly. Drop just the last turn —
+            # much less destructive than a full reset — and tell the user
+            # to reformulate. We deliberately do NOT auto-retry: the same
+            # query would overflow the same way. Reformulation is the only
+            # real recovery (or /reset if the user prefers a clean slate).
+            if _is_context_overflow_error(e):
+                # Same sliding-window recovery as the trim-time path: do a
+                # clean reset rather than partial cleanup. Half-state
+                # poisons future turns; full reset doesn't.
+                logger.warning(
+                    "Context-overflow mid-invoke (%s) — resetting "
+                    "conversation and informing the user",
+                    type(e).__name__,
+                )
+                cleared = 0
+                try:
+                    cleared = await self._hard_clear_history(config)
+                except Exception as clear_err:
+                    logger.error(
+                        "Hard clear failed: %s", clear_err, exc_info=True
+                    )
+                return {"messages": [{"role": "ai", "content":
+                    self._context_overflow_message(cleared)
+                }]}
 
             # INVALID_CHAT_HISTORY caught directly (no recoverable error
             # preceded it). Same hard-clear + retry path.
@@ -1639,7 +2174,9 @@ class AgentBasic:
                 )
                 try:
                     await self._hard_clear_history(config)
-                    return await self.graph.ainvoke(messages, config=config)
+                    result = await self.graph.ainvoke(messages, config=config)
+                    self._capture_usage_from_result(result)
+                    return result
                 except Exception as e2:
                     logger.error("Hard-clear retry failed: %s", e2, exc_info=True)
                 return {"messages": [{"role": "ai", "content":
@@ -1663,5 +2200,43 @@ class AgentBasic:
             "from it automatically. Please try sending your message again — if "
             "the issue persists for a few minutes, the connected services "
             "(database, analytics, integrations) may be having trouble. The "
-            "agent's logs have full details for diagnostics."
+            "agent's logs have full details for diagnostics.\n\n"
+            "If the same error keeps happening, type **/reset** to clear the "
+            "conversation history and start fresh."
+        )
+
+    @staticmethod
+    def _context_overflow_message(cleared: int) -> str:
+        """Friendly message when the conversation grew past what the
+        configured token budget can hold, even with the sliding-window
+        trim shrunk to a single turn.
+
+        Design choice: we do a FULL reset rather than partial cleanup.
+        Partial cleanup (e.g. removing only the last turn) leaves
+        AIMessages from earlier turns in state — and once one of those
+        is a "soft" refusal or a confused response, the model reads its
+        own past output on subsequent turns and reinforces the same
+        unhelpful pattern. Resetting cleanly avoids that mode collapse
+        at the cost of losing prior context (which was about to be
+        trimmed anyway).
+
+        `cleared` is the number of messages we removed. 0 means state
+        was already empty or the cleanup itself failed."""
+        if cleared > 0:
+            return (
+                "The conversation grew larger than the configured context "
+                f"budget could hold. I had to reset the history "
+                f"({cleared} message{'s' if cleared != 1 else ''} removed) "
+                "to recover.\n\n"
+                "All tools are still available — please re-send your "
+                "question or ask a new one. To keep future conversations "
+                "short, try narrower queries (smaller LIMIT, fewer rows, "
+                "aggregates instead of raw detail).\n\n"
+                "You can also type **/reset** at any time to start a "
+                "clean conversation."
+            )
+        return (
+            "The conversation grew larger than the configured context "
+            "budget could hold, and I couldn't reset the history "
+            "automatically. Please type **/reset** to start fresh."
         )
