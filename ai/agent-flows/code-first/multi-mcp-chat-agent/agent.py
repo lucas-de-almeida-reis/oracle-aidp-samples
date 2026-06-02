@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 # ║   provider). A hard turn cap is a deterministic workaround   ║
 # ║   independent of any provider-side limit.                    ║
 # ╚══════════════════════════════════════════════════════════════╝
-MAX_TURNS_KEPT = 0
+MAX_TURNS_KEPT = 5
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -290,20 +290,22 @@ LLM_MODEL_ID       = CFG.get("llm", {}).get("model_id", "")
 # allowed". The corresponding trim path becomes a no-op for that turn.
 # Treat 0 as "leave it alone" rather than a real ceiling.
 #
-# `max_turns` (preferred when set): cap conversation history to the last N
-# user turns regardless of token size. Simple, deterministic, customer-
-# friendly. Set this when you want a hard ceiling and don't want to think
-# about token math.
+# Turn-count cap: see the MAX_TURNS_KEPT constant in the header block at
+# the top of this file. It's deliberately NOT a config.yaml value — keep
+# conversation-history policy in code where it's reviewed, not in per-
+# deployment config. It caps history to the last N user turns regardless
+# of token size (simple, deterministic) and is the most effective lever
+# against long-context tool-use degradation ("laziness").
 #
-# `max_context_tokens`: cap by token count. The agent drops oldest turns so
+# `max_context_tokens` (this config knob): cap by token count. The agent
+# drops oldest turns so
 # `max_context_tokens − response_reserve_tokens − system_prompt − tool_defs`
 # isn't exceeded. Use this when conversation length varies wildly with tool
-# response sizes and you want a budget-based ceiling instead.
+# response sizes and you want a budget-based ceiling.
 #
-# Both can be set at once; whichever cuts more aggressively wins on a given
-# turn. AIMessage(tool_calls) and the matching ToolMessage(s) are kept or
-# dropped together in both modes.
-LLM_MAX_TURNS               = int(CFG.get("llm", {}).get("max_turns", 0) or 0)
+# MAX_TURNS_KEPT and max_context_tokens can both be active; whichever cuts
+# more aggressively wins on a given turn. AIMessage(tool_calls) and the
+# matching ToolMessage(s) are kept or dropped together in both modes.
 LLM_MAX_CONTEXT_TOKENS      = int(CFG.get("llm", {}).get("max_context_tokens", 0) or 0)
 LLM_RESPONSE_RESERVE_TOKENS = int(CFG.get("llm", {}).get("response_reserve_tokens", 1024) or 1024)
 
