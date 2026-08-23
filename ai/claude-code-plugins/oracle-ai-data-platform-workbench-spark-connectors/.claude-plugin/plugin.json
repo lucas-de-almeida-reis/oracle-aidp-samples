@@ -1,7 +1,7 @@
 {
   "name": "oracle-ai-data-platform-workbench-spark-connectors",
-  "version": "0.6.0",
-  "description": "Oracle AI Data Platform Workbench Spark connectors for Claude Code. 25 connector skills covering Oracle, OCI, SaaS, JDBC, object storage, streaming, REST, Excel, and multi-cloud data sources, including dedicated Azure SQL, NetSuite, and read-only AIDP Snowflake connector guidance.",
+  "version": "0.7.0",
+  "description": "Oracle AI Data Platform Workbench Spark connectors for Claude Code. 26 connector skills covering Oracle, OCI, SaaS, JDBC, object storage, streaming, REST, Excel, and multi-cloud data sources, including dedicated DB2 and Azure SQL guidance.",
   "author": {
     "name": "Ahmed Awan"
   },
@@ -29,6 +29,7 @@
     "mysql",
     "sqlserver",
     "azure-sql",
+    "db2",
     "snowflake",
     "netsuite",
     "adls",

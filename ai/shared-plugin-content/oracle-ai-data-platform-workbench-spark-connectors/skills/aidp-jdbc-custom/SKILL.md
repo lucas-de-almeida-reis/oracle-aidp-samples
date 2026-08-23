@@ -6,7 +6,7 @@ allowed-tools: Read, Write, Edit, Bash
 
 # `aidp-jdbc-custom` — Generic JDBC escape hatch
 
-The catch-all skill for any DB with a JDBC driver. Skips the AIDP `aidataplatform` format and uses native Spark JDBC. Useful for DBs like SQLite, ClickHouse, DuckDB, IBM DB2, SAP HANA, or any niche driver the user has uploaded.
+The catch-all skill for any DB with a JDBC driver. Skips the AIDP `aidataplatform` format and uses native Spark JDBC. Useful for DBs like SQLite, ClickHouse, DuckDB, SAP HANA, or any niche driver the user has uploaded. (IBM DB2 has a dedicated connector on AIDP 4.1+ — use [`aidp-db2`](../aidp-db2/SKILL.md).)
 
 ## When to use
 - The DB doesn't have a dedicated `aidp-*` skill in this plugin.
@@ -81,7 +81,7 @@ df = (spark.read.format("jdbc")
 | SQLite | `org.sqlite.JDBC` | `jdbc:sqlite:` |
 | ClickHouse | `com.clickhouse.jdbc.ClickHouseDriver` | `jdbc:clickhouse://` |
 | DuckDB | `org.duckdb.DuckDBDriver` | `jdbc:duckdb:` |
-| IBM DB2 | `com.ibm.db2.jcc.DB2Driver` | `jdbc:db2://` |
+| IBM DB2 (pre-4.1 AIDP only — prefer `aidp-db2` / `type=DB2`) | `com.ibm.db2.jcc.DB2Driver` | `jdbc:db2://` |
 | SAP HANA | `com.sap.db.jdbc.Driver` | `jdbc:sap://` |
 | Vertica | `com.vertica.jdbc.Driver` | `jdbc:vertica://` |
 

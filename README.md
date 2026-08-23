@@ -71,7 +71,7 @@ Patterns for connecting to and loading data from a wide range of sources.
 | Notebook | Description |
 |---|---|
 | [Read/Write Oracle Ecosystem Connectors](data-engineering/ingestion/Read_Write_Oracle_Ecosystem_Connectors.ipynb) | Connect to Oracle Database, Oracle Exadata, ALH, and ATP with external catalog support and SQL pushdown. |
-| [Read/Write External Ecosystem Connectors](data-engineering/ingestion/Read_Write_External_Ecosystem_Connectors.ipynb) | Read/write operations with Hive Metastore, Microsoft SQL Server, PostgreSQL, and MySQL. |
+| [Read/Write External Ecosystem Connectors](data-engineering/ingestion/Read_Write_External_Ecosystem_Connectors/) | Per-database read/write ingestion notebooks — Hive Metastore, Microsoft SQL Server, Azure SQL, PostgreSQL, MySQL, and IBM DB2 (4.1) — each with SQL pushdown and a connector-options reference. |
 | [Read-Only Ingestion Connectors](data-engineering/ingestion/Read_Only_Ingestion_Connectors.ipynb) | Use read-only connectors for MySQL HeatWave, REST APIs, Oracle Fusion BICC, Kafka, and other sources. |
 | [Connect Using Custom JDBC Driver](data-engineering/ingestion/Connect_Using_Custom_JDBC_Driver.ipynb) | Integrate custom JDBC drivers (e.g., SQLite, Snowflake) with Spark for connecting to databases not bundled by default. |
 | [Execute Oracle ALH SQL](data-engineering/ingestion/Execute%20Oracle%20ALH%20SQL.ipynb) | Execute SQL statements directly against Oracle ALH using the `oracledb` Python package. |
@@ -253,7 +253,7 @@ Python tool packages that extend agent flows with user-authored capabilities. Up
 
 | Sample | Description |
 |---|---|
-| [Claude Code Plugins for AIDP](ai/claude-code-plugins/README.md) | Anthropic Claude Code plugins published by the Oracle AIDP team. Includes the `oracle-ai-data-platform-workbench-spark-connectors` plugin — 18 model-invokable skills connecting Spark notebooks to Oracle (ALH/ADW/ATP, ExaCS, Fusion, BICC, EPM, Essbase) and external (PostgreSQL, MySQL/HeatWave, SQL Server, Snowflake, ADLS Gen2, S3, OCI Streaming, Object Storage, Iceberg, REST/JDBC, Excel) sources. |
+| [Claude Code Plugins for AIDP](ai/claude-code-plugins/README.md) | Anthropic Claude Code plugins published by the Oracle AIDP team. Includes the `oracle-ai-data-platform-workbench-spark-connectors` plugin — 28 model-invokable skills (26 connectors) connecting Spark notebooks to Oracle (ALH/ADW/ATP, ExaCS, Oracle DB, Fusion, BICC, EPM, Essbase, PeopleSoft, Siebel, NetSuite) and external (PostgreSQL, MySQL/HeatWave, SQL Server, Azure SQL, IBM DB2, Snowflake, Salesforce, Hive, ADLS Gen2, S3, OCI Streaming, Object Storage, Iceberg, REST/JDBC, Excel) sources. |
 
 ---
 

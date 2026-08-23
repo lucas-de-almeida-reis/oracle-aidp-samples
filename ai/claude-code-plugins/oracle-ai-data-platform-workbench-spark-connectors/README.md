@@ -3,9 +3,9 @@
 > **Canonical home:** [`oracle-samples/oracle-aidp-samples/ai/claude-code-plugins/oracle-ai-data-platform-workbench-spark-connectors`](https://github.com/oracle-samples/oracle-aidp-samples/tree/main/ai/claude-code-plugins/oracle-ai-data-platform-workbench-spark-connectors).
 > This repository is now a personal development mirror. End users should install via Anthropic's community marketplace (see below), which sources from the canonical Oracle-org location.
 
-A Claude Code plugin that ships **25 model-invokable skills** for connecting Oracle AI Data Platform Workbench Spark notebooks to every data source these notebooks commonly need. Each skill produces plain Python (Spark JDBC, Spark structured streaming, Spark `oci://`/`s3a://`/`abfss://`, or REST → Spark DataFrame) that runs in the notebook without any additional runtime.
+A Claude Code plugin that ships **26 model-invokable skills** for connecting Oracle AI Data Platform Workbench Spark notebooks to every data source these notebooks commonly need. Each skill produces plain Python (Spark JDBC, Spark structured streaming, Spark `oci://`/`s3a://`/`abfss://`, or REST → Spark DataFrame) that runs in the notebook without any additional runtime.
 
-**v0.6.0** adds Azure SQL and NetSuite guidance, and refreshes Snowflake for the AIDP 4.0 connector contract. Snowflake and NetSuite are explicitly read-only.
+**v0.7.0** adds DB2 guidance for the AIDP 4.1 connector release. Snowflake and NetSuite remain read-only.
 
 All connectors wrap the official AIDP `aidataplatform` Spark format handler (or, where applicable, Spark JDBC / structured streaming / `oci://`/`s3a://`/`abfss://`) — same patterns shown in the upstream [`oracle-samples/oracle-aidp-samples`](https://github.com/oracle-samples/oracle-aidp-samples) connector notebooks.
 
@@ -27,7 +27,7 @@ Or from this development mirror (gets the latest pre-release commits):
 
 ## What's in here
 
-27 skills total (25 connectors + 1 bootstrap + 1 routing).
+28 skills total (26 connectors + 1 bootstrap + 1 routing).
 
 ### Oracle / OCI sources
 | Skill | Target | Transport | Recommended auth |
@@ -35,10 +35,10 @@ Or from this development mirror (gets the latest pre-release commits):
 | `aidp-connectors-overview` | (router) | — | — |
 | `aidp-connectors-bootstrap` | one-time setup | — | — |
 | `aidp-alh` | Oracle Autonomous DB family (ALH / ADW / ATP) | Spark JDBC | Wallet (mTLS), IAM DB-Token, or API key |
-| `aidp-oracle-db` ⭐ NEW | Generic Oracle DB (Compute / Base DB / on-prem / 19c-26ai non-Autonomous) | `aidataplatform` (`type=ORACLE_DB`) | Plain user/password |
+| `aidp-oracle-db` | Generic Oracle DB (Compute / Base DB / on-prem / 19c-26ai non-Autonomous) | `aidataplatform` (`type=ORACLE_DB`) | Plain user/password |
 | `aidp-exacs` | Exadata Cloud Service | Spark JDBC (TCP 1521 + NNE AES256) | Plain user/password |
-| `aidp-peoplesoft` ⭐ NEW | Oracle PeopleSoft | `aidataplatform` (`type=ORACLE_PEOPLESOFT`) | Plain user/password (read-only) |
-| `aidp-siebel` ⭐ NEW | Oracle Siebel CRM | `aidataplatform` (`type=ORACLE_SIEBEL`) | Plain user/password (read-only) |
+| `aidp-peoplesoft` | Oracle PeopleSoft | `aidataplatform` (`type=ORACLE_PEOPLESOFT`) | Plain user/password (read-only) |
+| `aidp-siebel` | Oracle Siebel CRM | `aidataplatform` (`type=ORACLE_SIEBEL`) | Plain user/password (read-only) |
 | `aidp-fusion-rest` | Fusion ERP/HCM/SCM | REST → DataFrame | HTTP Basic |
 | `aidp-fusion-bicc` | Fusion BICC bulk extracts | `aidataplatform` (`type=FUSION_BICC`) | HTTP Basic |
 | `aidp-epm-cloud` | EPM Cloud Planning | REST → DataFrame | HTTP Basic (`tenancy.user@domain`) |
@@ -54,12 +54,13 @@ Or from this development mirror (gets the latest pre-release commits):
 | `aidp-mysql` | MySQL / OCI MySQL HeatWave | `aidataplatform` (`type=MYSQL` or `MYSQL_HEATWAVE`) | Plain user/password |
 | `aidp-sqlserver` | Microsoft SQL Server | `aidataplatform` (`type=SQLSERVER`) | Plain user/password |
 | `aidp-azuresql` | Azure SQL Database | `aidataplatform` (`type=AZURE_SQLSERVER`) | Plain user/password |
-| `aidp-hive` ⭐ NEW | Apache Hive (HiveServer2, non-Kerberos) | `aidataplatform` (`type=HIVE`) | Plain user/password |
+| `aidp-db2` ⭐ NEW | IBM DB2 | `aidataplatform` (`type=DB2`) | Plain user/password |
+| `aidp-hive` | Apache Hive (HiveServer2, non-Kerberos) | `aidataplatform` (`type=HIVE`) | Plain user/password |
 
 ### SaaS
 | Skill | Target | Transport | Recommended auth |
 |---|---|---|---|
-| `aidp-salesforce` ⭐ NEW | Salesforce (Sales/Service Cloud, custom sObjects) | `aidataplatform` (`type=SFORCE`) | Username + password+security-token (read-only) |
+| `aidp-salesforce` | Salesforce (Sales/Service Cloud, custom sObjects) | `aidataplatform` (`type=SFORCE`) | Username + password+security-token (read-only) |
 | `aidp-netsuite` | NetSuite SuiteAnalytics Connect (read-only) | `aidataplatform` (`type=NETSUITE`) | Username/password or OAuth access token |
 
 ### Multi-cloud + escape hatches

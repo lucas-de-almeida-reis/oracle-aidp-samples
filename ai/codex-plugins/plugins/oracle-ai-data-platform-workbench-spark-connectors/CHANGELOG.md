@@ -2,6 +2,11 @@
 
 All notable changes to this plugin are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this plugin adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-08-21
+
+- Added `aidp-db2` for the dedicated `DB2` AIDP connector, with ingestion read/write and `pushdown.sql` patterns. DB2 external-catalog access is explicitly excluded from the 4.1 release.
+- Updated the connector router, helper supported-type documentation, and plugin metadata for DB2.
+
 ## [0.6.0] — 2026-07-10
 
 - Added `aidp-azuresql` for the dedicated `AZURE_SQLSERVER` AIDP connector, including ingestion read/write, external-catalog, `catalog.id`, and `pushdown.sql` patterns.

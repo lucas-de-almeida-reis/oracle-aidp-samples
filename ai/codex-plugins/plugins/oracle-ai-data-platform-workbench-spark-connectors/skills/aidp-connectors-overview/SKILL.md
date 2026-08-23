@@ -1,6 +1,6 @@
 ---
 name: aidp-connectors-overview
-description: Help the user pick the right connector skill for their data source from an AIDP notebook. Use as a router when the user mentions multiple sources, isn't sure which connector applies, or asks "how do I connect to X from AIDP". Covers 25 data sources — Oracle Autonomous DB family (ALH/ADW/ATP), generic Oracle DB, ExaCS, PeopleSoft, Siebel, Fusion ERP/BICC, EPM Cloud, Essbase, OCI Streaming, Object Storage, Iceberg, plus PostgreSQL, MySQL/HeatWave, SQL Server, Azure SQL, Hive, Snowflake, Azure ADLS, AWS S3, Salesforce, NetSuite, generic REST, custom JDBC, Excel.
+description: Help the user pick the right connector skill for their data source from an AIDP notebook. Use as a router when the user mentions multiple sources, isn't sure which connector applies, or asks "how do I connect to X from AIDP". Covers 26 data sources — Oracle Autonomous DB family (ALH/ADW/ATP), generic Oracle DB, ExaCS, PeopleSoft, Siebel, Fusion ERP/BICC, EPM Cloud, Essbase, OCI Streaming, Object Storage, Iceberg, plus PostgreSQL, MySQL/HeatWave, DB2, SQL Server, Azure SQL, Hive, Snowflake, Azure ADLS, AWS S3, Salesforce, NetSuite, generic REST, custom JDBC, Excel.
 allowed-tools: Read
 ---
 
@@ -45,6 +45,7 @@ Otherwise, pick the right skill from this table and **invoke that skill**. Don't
 | "MySQL", "HeatWave", "MDS", "MySQL Database Service" | [`aidp-mysql`](../aidp-mysql/SKILL.md) |
 | "SQL Server", "MSSQL", "TDS" | [`aidp-sqlserver`](../aidp-sqlserver/SKILL.md) |
 | "Azure SQL", "Azure SQL Database", "database.windows.net" | [`aidp-azuresql`](../aidp-azuresql/SKILL.md) |
+| "DB2", "Db2", "IBM Db2", "LUW" | [`aidp-db2`](../aidp-db2/SKILL.md) |
 | "Hive", "HiveServer2", "HS2", "HCatalog", non-Kerberos Hive | [`aidp-hive`](../aidp-hive/SKILL.md) |
 
 ### SaaS
@@ -62,7 +63,7 @@ Otherwise, pick the right skill from this table and **invoke that skill**. Don't
 | "ADLS", "Azure Data Lake", "abfss" | [`aidp-azure-adls`](../aidp-azure-adls/SKILL.md) |
 | "S3", "AWS S3", "s3a" | [`aidp-aws-s3`](../aidp-aws-s3/SKILL.md) |
 | "Generic REST", "manifest URL", "manifest.path", REST endpoint with manifest schema | [`aidp-rest-generic`](../aidp-rest-generic/SKILL.md) |
-| "Custom JDBC", "ClickHouse", "DuckDB", "DB2", "SAP HANA", any DB without a dedicated skill | [`aidp-jdbc-custom`](../aidp-jdbc-custom/SKILL.md) |
+| "Custom JDBC", "ClickHouse", "DuckDB", "SAP HANA", any DB without a dedicated skill | [`aidp-jdbc-custom`](../aidp-jdbc-custom/SKILL.md) |
 | ".xlsx", "Excel", "spreadsheet ingestion" | [`aidp-excel`](../aidp-excel/SKILL.md) |
 
 ## What's blocked at the AIDP platform level (so you don't try)
