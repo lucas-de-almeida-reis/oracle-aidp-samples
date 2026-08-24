@@ -25,6 +25,8 @@ oracle-aidp-samples/
 │       ├── scd/
 │       └── streaming/
 ├── ai/
+│   ├── agent-hub/            # Agent Hub code-first agent samples
+│   │   └── agent-samples/
 │   ├── agent-flows/          # Agent orchestration and scheduling
 │   └── ml-datascience/       # ML, LLM, and AI service integrations
 └── shared-utils/             # Reusable utilities and data generators
@@ -198,6 +200,12 @@ Notebooks covering generative AI, NLP, ML model training, and LLM-powered analyt
 | [Agent Flow Schedule Trigger](ai/agent-flows/misc/agent-flow-schedule-trigger/task_notebook.ipynb) | Invoke AIDP agent flows via REST API using OCI request signing, demonstrating programmatic agent orchestration with custom message handling. |
 | [Invoke Agent Flows from APEX](ai/agent-flows/misc/invoke-agent-flows-from-apex/README.md) | Oracle APEX region plugin that adds a chat UI for AIDP agents, with persistent conversation history, async Oracle AQ-backed response processing, and conversation summarization. |
 | [Invoke Agent Flows from Streamlit](ai/agent-flows/misc/invoke-agent-flows-from-streamlit/README.md) | Streamlit chat app for AIDP agents with streaming responses, trace/span visualization, multiple auth modes (API key, security token, resource principal), and OCI Container Instance deployment. |
+
+#### Agent Hub Samples
+
+| Sample | Description |
+|---|---|
+| [A2UI Component Gallery](ai/agent-hub/agent-samples/a2ui-component-gallery/README.md) | Demonstrate a code-first Agent Hub agent that negotiates A2UI v0.8 or v0.9 and renders schema-validated component previews with interactive actions. |
 
 #### Visual (No-Code) Agent Flows
 
