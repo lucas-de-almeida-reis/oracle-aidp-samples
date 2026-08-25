@@ -1,0 +1,152 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Multi-MCP Chat Agent (hardened) — session-variable auth          ║
+# ║                                                                  ║
+# ║  Copy to config.yaml and fill in. Runs BOTH on AIDP (aidputils   ║
+# ║  present → OCI principal auth) and LOCALLY (aidputils absent →    ║
+# ║  OCI API-key auth). Bearers for the MCP servers come from AIDP    ║
+# ║  session variables (prod) or the Variables tab / dev_bearer (dev) ║
+# ║  — this agent never mints tokens.                                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+llm:
+  compartment_id: ocid1.compartment.oc1..your-compartment-ocid
+  region: us-ashburn-1
+  model_id: xai.grok-4-fast-non-reasoning
+  model_args:
+    max_tokens: 4000
+    temperature: 0.2
+    top_p: 0.9
+
+  # Auth: leave blank to auto-pick — "principal" on AIDP (aidputils signer),
+  # "api_key" locally. Force one by setting it explicitly.
+  auth: ""
+  # Only used when auth = api_key (local runs):
+  oci_config_file: "~/.oci/config"
+  oci_config_profile: "DEFAULT"
+
+  # Context management (see agent.py). MAX_TURNS_KEPT (code) is always on;
+  # token-budget trim below is optional (0 = off).
+  max_context_tokens: 0
+  response_reserve_tokens: 1024
+
+
+integrations:
+
+  # ADB Select AI — endpoint built from ocid + region.
+  adb:
+    enabled: false
+    ocid: ocid1.autonomousdatabase.oc1.iad.your-adb-ocid
+    region: us-ashburn-1
+    bearer_session_variable: sessionvariables.cred.mcp.adb.bearer
+    # dev_bearer: only for LOCAL runs (no session variable). Leave empty on AIDP.
+    dev_bearer: ""
+
+  # OAC — endpoint = <url>/api/mcp.
+  oac:
+    enabled: true
+    url: https://your-oac-host.analytics.ocp.oraclecloud.com
+    bearer_session_variable: sessionvariables.cred.mcp.oac.bearer
+    dev_bearer: ""
+
+  # OIC — endpoint = the project MCP URL.
+  oic:
+    enabled: false
+    mcp_url: https://your-oic-host.integration.your-region.ocp.oraclecloud.com/mcp-server/v1/projects/YOUR_PROJECT_ID/mcp
+    bearer_session_variable: sessionvariables.cred.mcp.oic.bearer
+    dev_bearer: ""
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Prompt — tune the agent WITHOUT editing agent.py                 ║
+# ║                                                                  ║
+# ║  system_prompt : if set, REPLACES the whole built-in prompt.     ║
+# ║  extra_rules   : appended after the built-in generic rules. Put   ║
+# ║                  your domain rules here (subject areas, date      ║
+# ║                  formats, gotchas). Each list item is one rule;   ║
+# ║                  use YAML block scalars ( - | ) for long ones.    ║
+# ║                                                                  ║
+# ║  The example rules below are the "Revenue Insight AIDP" tuning —  ║
+# ║  edit/replace them for your own OAC subject area.                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+prompt:
+  system_prompt: ""
+
+  extra_rules:
+    - |
+      OAC scope: query OAC subject-area objects ONLY with Logical SQL. NEVER use
+      Dataset objects (XSA). ONLY use the "Revenue Insight AIDP" subject area; do
+      NOT query any other. If the user asks about data not in Revenue Insight
+      AIDP, say it is not available.
+    - |
+      Invoice Period / date filtering: convert a spoken month+year to YYYY-MM
+      (January 2026 -> 2026-01; Feb 2025 -> 2025-02). Filter the Invoice Period
+      table with YYYY-MM; if zero rows, retry Mon-YY (Jan-26). DATE RESILIENCE: a
+      period the user explicitly named almost certainly HAS data — if your filter
+      returns zero, your FILTER is wrong, not the data: run DISTINCT "Invoice
+      Period"."Year Month" (or describe_data) to find the stored format, then
+      retry. NEVER answer a different period than asked. Only say "no data" AFTER
+      verifying the format and still getting zero.
+    - |
+      Latest-period trap: the raw Date column and Year dimension contain empty
+      placeholder members as far out as 2032. NEVER use MAX(Date) or MAX of a bare
+      Year / Year Month to find "the latest period" — it lands on an empty future
+      date and every downstream filter returns zero. Instead select the period
+      column TOGETHER WITH the USD Amount measure and ORDER BY period DESC FETCH
+      FIRST 1 ROW ONLY (the measure join drops empty periods, so the top row is the
+      true latest month with data). Resolve "this year/last year/last quarter"
+      against that anchor; never anchor on today's calendar date, never ask the
+      user for the period.
+    - |
+      Filter dimensions in Revenue Insight AIDP: Bill Class (Bill Class table),
+      Customer Name & CUP Name (Customer table), Fee (Fee table), Entity (Entity
+      table), Product (Product table). Use LIKE with wildcards for partial matches.
+      If a query returns zero rows, do NOT invent data: run a DISTINCT LIKE query,
+      show up to 10 possible matches, and ask the user to pick one. Never return
+      empty without first trying a partial match and asking.
+    - |
+      Year-over-year growth: AGO() and FORECAST() do NOT work here (no Time
+      Dimension — AGO returns null, growth wrongly shows 0%). Compute growth with
+      TWO SEPARATE QUERIES; do NOT use FILTER(...USD Amount USING ...Year='<yyyy>')
+      (it silently mismatches entities across years). (1) default to the latest
+      COMPLETE year vs the year before; (2) QUERY 1: rank entities WHERE
+      Year='<current>', record exact names; (3) QUERY 2: SELECT name + USD Amount
+      WHERE Year='<prior>' AND name IN (<names from Q1>); (4) join by name, growth%
+      = (cur-prior)/prior*100. "n/a" only if a name is genuinely absent from Q2 —
+      never from a null. SANITY CHECK: a top current-year entity almost always had
+      prior-year revenue — if it shows 0/n/a, re-run Q2 for just that name.
+    - |
+      Measures (e.g. USD Amount) AUTO-AGGREGATE — do NOT add an explicit GROUP BY
+      when selecting a measure (raises nQSError 42020). Select the attribute(s) +
+      the measure and let OAC group; use ORDER BY + FETCH FIRST n ROWS ONLY for
+      rankings.
+    - |
+      Aggregation self-check: when breaking a measure down by a dimension, values
+      across rows should VARY. If every row shows the SAME number, the dimension
+      did not constrain the measure — you returned the GRAND TOTAL per row, a query
+      BUG (not "placeholder" data). Re-query until rows show real per-group
+      variation.
+    - |
+      Forecasting: this subject area has NO Time Dimension, so FORECAST()/time-
+      series prediction cannot run. If asked to forecast/predict FUTURE periods,
+      REFUSE honestly (explain the missing Time Dimension) — do NOT extrapolate or
+      hand-roll forecast numbers (still fabrication).
+    - |
+      Rolling / moving-window averages: MAVG(), PERIODROLLING(), RSUM() are NOT
+      reliable here (no Time Dimension → they compute over ROW ORDER, values bleed
+      across rows). Compute manually: query per-period revenue for each category
+      over the window (plain aggregation is reliable), then average those N values
+      yourself. If you cannot get the per-period rows, say so and STOP.
+    - |
+      Always render the data: when asked to show/list/compare, present the ACTUAL
+      rows as a table. Never reply only that rows "were returned", never tell the
+      user to pivot/sort/download it themselves. Render large results in full.
+    - |
+      Resolve ambiguity yourself: if a field is ambiguous, pick the most defensible
+      column, STATE which you chose, and ANSWER — do not stop to ask which field to
+      use (only ask back when a query genuinely returns zero rows and you need a
+      value to filter on).
+    - |
+      Tool-call hygiene: issue ONE tool call at a time and wait for its result
+      before the next — do NOT emit several tool calls in one turn. EVERY
+      describe_data call MUST include both 'datamodelName' and 'tableName'; never
+      call any tool with empty arguments {}.

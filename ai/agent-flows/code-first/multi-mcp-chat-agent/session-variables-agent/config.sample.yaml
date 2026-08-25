@@ -1,0 +1,79 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Multi-MCP Chat Agent — session-variable auth — configuration     ║
+# ║                                                                  ║
+# ║  Copy this file to config.yaml and fill in your values.          ║
+# ║  Set 'enabled: false' on any integration you don't want.         ║
+# ║                                                                  ║
+# ║  NOTE: unlike ../config.sample.yaml, there are NO credentials    ║
+# ║  here (no password / client_secret / private key / ocid /        ║
+# ║  idcs_host). This agent never mints tokens — the bearer for each ║
+# ║  MCP server arrives as a session variable (see README.md).       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+# ─── LLM (always required) ─────────────────────────────────────────
+# OCI Generative AI is the LLM backend. The agent uses the OCI signer
+# principal injected by AIDP — no API key needed.
+llm:
+  compartment_id: ocid1.compartment.oc1..your-compartment-ocid
+  region: us-ashburn-1
+  model_id: xai.grok-4-fast-non-reasoning
+  # Optional model args passed straight to OCI Gen AI. Lower temperature is
+  # steadier for tool use; a generous max_tokens keeps data tables from
+  # being truncated mid-answer (a too-low cap is a common "cut message" bug).
+  model_args:
+    max_tokens: 4000
+    temperature: 0.2
+    top_p: 0.9
+  # ─── Context management ──────────────────────────────────────────
+  # The agent keeps conversations stable against long-context tool-use
+  # degradation (worsened by OCI generic-provider schema flattening) with:
+  #   • MAX_TURNS_KEPT (constant in agent.py, default 5) — hard cap on the
+  #     number of recent user turns. The primary, always-on lever.
+  #   • max_context_tokens (below) — OPTIONAL token-budget trim. 0 disables
+  #     it; set to (a fraction of) your model's context window to also drop
+  #     oldest turns by token size. response_reserve_tokens is headroom
+  #     kept for the model's reply.
+  max_context_tokens: 0
+  response_reserve_tokens: 1024
+
+
+integrations:
+
+  # ─── ADB Select AI MCP ───────────────────────────────────────────
+  # endpoint = the MCP URL of your ADB (after enabling the mcp_server
+  # feature tag and registering at least one Select AI tool). Pattern:
+  #   https://dataaccess.adb.<region>.oraclecloudapps.com/adb/mcp/v1/databases/<adb_ocid>
+  adb:
+    enabled: true
+    server_name: adb_selectai
+    endpoint: https://dataaccess.adb.<region>.oraclecloudapps.com/adb/mcp/v1/databases/<adb_ocid>
+    transport: streamable_http
+    # The bearer for ADB arrives in THIS session variable (dev: Variables
+    # tab; prod: passed by the calling app). The code references it as
+    # {{sessionvariables.cred.mcp.adb.bearer}} — never store a token here.
+    bearer_session_variable: sessionvariables.cred.mcp.adb.bearer
+    headers: {}
+
+  # ─── OAC MCP ─────────────────────────────────────────────────────
+  # endpoint = <oac-host>/api/mcp
+  oac:
+    enabled: false
+    server_name: oac_analytics
+    endpoint: https://your-oac-host.analytics.ocp.oraclecloud.com/api/mcp
+    transport: streamable_http
+    bearer_session_variable: sessionvariables.cred.mcp.oac.bearer
+    headers: {}
+
+  # ─── OIC MCP ─────────────────────────────────────────────────────
+  # endpoint = the project MCP URL:
+  #   https://<oic-host>/mcp-server/v1/projects/<projectId>/mcp
+  # OIC's MCP endpoint requires the SSE-style Accept header.
+  oic:
+    enabled: false
+    server_name: oic_integrations
+    endpoint: https://your-oic-host.integration.your-region.ocp.oraclecloud.com/mcp-server/v1/projects/YOUR_PROJECT_ID/mcp
+    transport: streamable_http
+    bearer_session_variable: sessionvariables.cred.mcp.oic.bearer
+    headers:
+      Accept: "application/json, text/event-stream"
