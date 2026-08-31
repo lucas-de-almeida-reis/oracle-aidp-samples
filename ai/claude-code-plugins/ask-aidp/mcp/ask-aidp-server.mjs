@@ -1462,17 +1462,49 @@ function normalizeSpawnTarget(command, args) {
   if (process.platform !== 'win32') return { command, args };
   const lower = command.toLowerCase();
   if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) return { command, args };
-  return {
-    command: process.env.ComSpec || 'cmd.exe',
-    args: ['/d', '/s', '/c', [quoteWindowsCmdArg(command), ...args.map(quoteWindowsCmdArg)].join(' ')]
-  };
+  // SECURITY: never invoke a .cmd/.bat shim through cmd.exe with interpolated
+  // arguments. cmd.exe's quoting cannot be made safe for a value containing a
+  // double-quote — it terminates the quoted region and drops back to unquoted
+  // parsing where &, |, > become command separators (RCE; CVE-2024-27980 /
+  // "BatBadBut" class). Instead resolve the shim to the Node script it wraps
+  // and spawn Node directly with an argv ARRAY (shell:false), so every
+  // metacharacter — the double-quote included — is passed as inert literal
+  // data. Fail closed if the underlying script can't be resolved.
+  const script = resolveCmdShimToNode(command);
+  if (script) return { command: process.execPath, args: [script, ...args] };
+  throw new Error(
+    `Refusing to execute the aidp CLI via the Windows shim ${command}: arguments ` +
+    `cannot be passed safely through cmd.exe. Point AIDP_CLI_BIN at the aidp Node ` +
+    `entry script (…/aidp-cli/dist/bin/aidp.js) or the platform binary instead.`
+  );
 }
 
-function quoteWindowsCmdArg(value) {
-  const text = String(value);
-  if (text === '') return '""';
-  if (!/[\s"&()<>^|%]/.test(text)) return text;
-  return `"${text.replace(/(["^&|<>()%])/g, '^$1')}"`;
+function resolveCmdShimToNode(cmdPath) {
+  // npm/pnpm/yarn .cmd/.bat shims launch Node against a wrapped .js entry, but
+  // the exact spelling of that path varies by generator/version — all of these
+  // occur in the wild:
+  //   "%~dp0\node_modules\aidp-cli\dist\bin\aidp.js"   (older npm)
+  //   "%dp0%\..\aidp-cli\dist\bin\aidp.js"             (current npm; dp0 var + relative ..)
+  //   "%~dp0../aidp-cli/dist/bin/aidp.js"              (forward slashes)
+  // Extract EVERY .js token, strip the dp0 directory variable, resolve what
+  // remains against the shim's own directory (honouring `..`), and return the
+  // first path that exists. Bypassing cmd.exe entirely is the whole point
+  // (see normalizeSpawnTarget); resolving Node's real entry robustly is what
+  // keeps the normal Windows aidp.cmd install working after that change.
+  let text;
+  try { text = readFileSync(cmdPath, 'utf8'); } catch { return null; }
+  const dir = path.dirname(cmdPath);
+  const tokens = text.match(/[^\s"'\r\n]+\.js\b/gi) || [];
+  for (const token of tokens) {
+    // Strip a leading dp0 directory variable in any of its spellings:
+    // %~dp0 , %dp0% , %dp0  — optionally followed by a path separator.
+    let rel = token.replace(/^%~?dp0%?[\\/]?/i, '');
+    if (rel.includes('%')) continue;             // still carries an unresolved %VAR% — skip
+    rel = rel.replace(/[\\/]+/g, path.sep);
+    const resolved = path.isAbsolute(rel) ? rel : path.resolve(dir, rel);
+    if (existsSync(resolved)) return resolved;
+  }
+  return null;
 }
 
 function parseCliJson(result) {
@@ -3906,7 +3938,18 @@ async function handleMessage(message) {
   }
 
   if (message.method === 'tools/call') {
-    const result = await handleToolCall(message.params?.name, message.params?.arguments || {});
+    // A tool that throws a pre-flight error (missing config, missing vendor
+    // dependency, unreadable localPath) should surface as a structured
+    // isError:true RESULT so the model can self-correct — not as a JSON-RPC
+    // -32000 protocol error carrying an internal stack trace with absolute
+    // filesystem paths. Matches the isError handling used for unknown tools
+    // and CLI/HTTP failures elsewhere in the server.
+    let result;
+    try {
+      result = await handleToolCall(message.params?.name, message.params?.arguments || {});
+    } catch (error) {
+      result = toolText(String(error?.message || error), true);
+    }
     jsonResponse(message.id, result);
     return;
   }
