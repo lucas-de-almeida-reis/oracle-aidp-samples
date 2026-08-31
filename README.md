@@ -261,7 +261,7 @@ Python tool packages that extend agent flows with user-authored capabilities. Up
 
 | Sample | Description |
 |---|---|
-| [Claude Code Plugins for AIDP](ai/claude-code-plugins/README.md) | Anthropic Claude Code plugins published by the Oracle AIDP team. Includes the `oracle-ai-data-platform-workbench-spark-connectors` plugin — 28 model-invokable skills (26 connectors) connecting Spark notebooks to Oracle (ALH/ADW/ATP, ExaCS, Oracle DB, Fusion, BICC, EPM, Essbase, PeopleSoft, Siebel, NetSuite) and external (PostgreSQL, MySQL/HeatWave, SQL Server, Azure SQL, IBM DB2, Snowflake, Salesforce, Hive, ADLS Gen2, S3, OCI Streaming, Object Storage, Iceberg, REST/JDBC, Excel) sources. |
+| [Claude Code Plugins for AIDP](ai/claude-code-plugins/README.md) | Anthropic Claude Code plugins published by the Oracle AIDP team. Includes Ask AIDP for 43-tool Workbench operations through `aidp-cli`, signed REST, and native SDK clients, plus connector, engineering, migration, and Fusion-to-OAC workflow plugins. |
 
 ---
 
