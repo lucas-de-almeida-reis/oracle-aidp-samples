@@ -202,7 +202,7 @@ Roles, role members, and role permissions.
 Schemas, tables, views, and schema permissions.
 
 - `aidp schema create` - Creates a schema.
-- `aidp schema create-data-table` - Creates a managed table with data loaded from a sample file.
+- `aidp schema create-data-table` - Creates a managed table with data loaded from a sample file. CSV input is read positionally: use a headerless file and `_c0`, `_c1`, ... in `selectedColumns`, with real names and types in `tableFields`.
 - `aidp schema create-table` - Creates a table.
 - `aidp schema create-view` - Creates a view.
 - `aidp schema delete` - Deletes a schema.

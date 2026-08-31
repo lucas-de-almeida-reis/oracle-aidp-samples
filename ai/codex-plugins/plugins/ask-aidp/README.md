@@ -4,13 +4,14 @@ This plugin connects Codex to Oracle AI Data Platform Workbench through every do
 
 ## Requirements
 
-- Codex CLI with plugin support and Node.js available to Codex.
+- Codex CLI with the `plugin` subcommand and Node.js available to Codex. The
+  installation flow is verified on `codex-cli 0.147.0`.
 - OCI config and credentials that can access the target AIDP instance.
 - The latest `aidp-cli` from
   [`oracle-samples/aidataplatform-sdk`](https://github.com/oracle-samples/aidataplatform-sdk),
   either on `PATH` or selected with `AIDP_CLI_BIN`.
 - The latest `aidp-typescript-client` and `oci-common` packages when using the
-  native SDK workspace Git tools.
+  native SDK workspace upload and Git tools.
 
 This GitHub directory is the plugin's source distribution. It does **not** contain
 generated `dist/` tarballs, zip files, or a vendored `node_modules` tree. Install the
@@ -22,7 +23,18 @@ For file work in notebooks, use AIDP Workbench path patterns such as `/Volumes/<
 
 For REST-only or advanced operations, use `aidp_rest_api_reference` to find the documented operation, then call `aidp_rest` with `dryRun: true` before a live request. The plugin signs the request with the configured OCI identity and only permits endpoint/method pairs from the generated Oracle REST catalog. The current documented endpoint version is `/20260430`.
 
-## Install From GitHub
+## Install Or Update With Codex — Recommended
+
+The easiest way to install or update the plugin is to prompt Codex with:
+
+```text
+Install or update plugin from https://github.com/oracle-samples/oracle-aidp-samples/tree/main/ai/codex-plugins/plugins/ask-aidp
+```
+
+After installation or update, restart the Codex app so it reloads the plugin,
+skill, and MCP server.
+
+## Install From GitHub Manually
 
 The same marketplace commands work on macOS, Linux, and Windows. Register the
 Oracle AIDP marketplace once:
@@ -30,6 +42,7 @@ Oracle AIDP marketplace once:
 ```bash
 codex plugin marketplace add oracle-samples/oracle-aidp-samples \
     --ref main \
+    --sparse .agents \
     --sparse ai/codex-plugins
 ```
 
@@ -45,9 +58,9 @@ Verify the installation:
 codex plugin list
 ```
 
-Start a new Codex thread after installation so the Ask AIDP skill and MCP tools
-are loaded. You do not need to download an archive, extract a plugin directory,
-or create `~/.agents/plugins/marketplace.json` manually.
+Restart the Codex app after installation, then start a new thread so the Ask AIDP
+skill and MCP tools are loaded. You do not need to download an archive, extract a
+plugin directory, or create `~/.agents/plugins/marketplace.json` manually.
 
 To update an existing installation:
 
@@ -56,13 +69,38 @@ codex plugin marketplace upgrade oracle-aidp-codex
 codex plugin add ask-aidp@oracle-aidp-codex
 ```
 
-Then start another new Codex thread.
+Restart the Codex app, then start another new thread.
+
+## Verify The Install
+
+Confirm that Codex installed and enabled version `0.9.1` and registered the MCP
+server:
+
+```bash
+codex plugin list
+codex mcp list
+```
+
+Maintainers and users working from a repository checkout can run the static QA
+suite. It does not contact AIDP or OCI, but it requires `aidp` on `PATH` or
+`AIDP_CLI_BIN` to point to the CLI executable:
+
+```bash
+cd ai/codex-plugins/plugins/ask-aidp
+node scripts/qa.mjs
+```
+
+Expected: `"ok": true`, 43 MCP tools, 242 CLI commands, and 257 REST operations.
 
 ## Configure AIDP
 
 Use [`examples/aidp.env.sample`](./examples/aidp.env.sample) as the template. Do
 not distribute a completed `aidp.env`, because it identifies a user's OCI profile,
 AIDP instance, workspace, and cluster.
+
+The MCP configuration does not inject environment variables. Configure them in
+the shell that launches Codex and restart an already-running Codex app after
+changing them.
 
 On macOS or Linux, download and load the sample from the shell that launches
 Codex:
@@ -107,6 +145,27 @@ If `oci login` does not work, configure OCI API key authentication using
 [Oracle's API signing key instructions](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm#two).
 Set `AIDP_AUTH=api_key`, select the profile with `OCI_PROFILE`, and set
 `OCI_CONFIG_FILE` when the OCI config is not in its default location.
+
+## Build Offline Archives — Maintainers
+
+The package build fails if its vendor source does not contain `aidp-cli`,
+`aidp-typescript-client`, and `oci-common`; this prevents publishing an archive
+that cannot run offline. On macOS or Linux, run from the repository root:
+
+```sh
+AIDP_VENDOR_NODE_MODULES=/absolute/path/to/node_modules \
+  node ai/codex-plugins/plugins/ask-aidp/scripts/package-plugin.mjs
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:AIDP_VENDOR_NODE_MODULES = "C:\absolute\path\to\node_modules"
+node ai/codex-plugins/plugins/ask-aidp/scripts/package-plugin.mjs
+```
+
+The archives, environment sample, and SHA-256 checksum file are written to
+`ai/codex-plugins/plugins/ask-aidp/dist/`.
 
 ## Use
 
@@ -226,6 +285,10 @@ The create-schema, create-Delta-table, create-table-with-data, create-catalog, a
 - `localDataFile`, which the tool stages through the same temporary upload target;
 - `objectStorageLocationPath`, when the data file is already in object storage.
 
+For inline `rows`, the staged CSV is headerless because `create-data-table` reads
+the source positionally. The tool uses `_c0`, `_c1`, and so on in
+`selectedColumns`; `tableFields` retains the real column names and types.
+
 This is an initial-load workflow for a newly-created managed table. For appending rows to an existing table, use `aidp_cli` or a notebook/workflow if that operation is exposed by your AIDP environment.
 
 Auto-heal workflow prompt:
@@ -258,5 +321,5 @@ Workflow runs create a local evidence directory with:
 - `aidp_create_table_with_data` uses `schema create-data-table`, which creates a managed table with an initial data load. It is not a general-purpose append/merge command for existing tables.
 - The GitHub marketplace source does not include generated archives or vendored
   Node dependencies. Install `aidp-cli` separately and set `AIDP_CLI_BIN` or
-  `PATH`; native workspace Git tools additionally require
+  `PATH`; native workspace upload and Git tools additionally require
   `aidp-typescript-client` and `oci-common` to be resolvable by the MCP server.

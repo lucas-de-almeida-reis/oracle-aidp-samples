@@ -2,6 +2,28 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.9.1] - 2026-08-27
+
+### Fixed
+
+- Stage inline-row CSV data without a header and use positional `selectedColumns`
+  so `schema create-data-table` does not ingest the header as a data row.
+- Upload workspace files through `WorkspaceObjectClient#createWorkspaceObject`,
+  with safe folder-conflict handling and dry-run placeholders that do not require
+  an instance OCID or read file contents.
+- Fail offline packaging when the vendor source is missing `aidp-cli`,
+  `aidp-typescript-client`, or `oci-common` instead of producing an incomplete
+  archive.
+
+### Changed
+
+- Strengthen static QA with exact version/tool-count checks, portable MCP and
+  symlink validation, marketplace resolution, JSON-only stdout enforcement, and
+  regression coverage for workspace upload and inline-row table loading.
+- Make prompt-based installation the recommended first option and document Codex
+  app restarts, post-install verification, environment inheritance, and guarded
+  offline packaging on macOS, Linux, and Windows.
+
 ## [0.9.0] - 2026-07-20
 
 ### Added

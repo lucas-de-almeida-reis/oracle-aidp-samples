@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -9,7 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(__filename), '..');
 const WORKSPACE_ROOT = path.resolve(PLUGIN_ROOT, '..', '..');
 const DIST_DIR = path.join(PLUGIN_ROOT, 'dist');
-const STAGING_ROOT = path.join(WORKSPACE_ROOT, '.plugin-build');
+const STAGING_ROOT = path.join(tmpdir(), 'ask-aidp-codex-plugin-build');
 const STAGING_PLUGIN = path.join(STAGING_ROOT, 'ask-aidp');
 const version = JSON.parse(readFileSync(path.join(PLUGIN_ROOT, '.codex-plugin', 'plugin.json'), 'utf8')).version;
 const baseName = `ask-aidp-codex-plugin-${version}`;
@@ -22,23 +23,32 @@ function run(command, args, cwd = WORKSPACE_ROOT) {
 rmSync(STAGING_ROOT, { recursive: true, force: true });
 mkdirSync(STAGING_ROOT, { recursive: true });
 mkdirSync(DIST_DIR, { recursive: true });
+const STAGING_EXCLUDES = new Set(['vendor', 'dist', 'qa-runs', 'qa-live-result.json', 'aidp.env', '.DS_Store']);
 cpSync(PLUGIN_ROOT, STAGING_PLUGIN, {
   recursive: true,
   filter: (src) => {
     const rel = path.relative(PLUGIN_ROOT, src);
-    return !rel.startsWith('qa-live-result.json')
-      && !rel.startsWith('qa-runs')
-      && !rel.startsWith('vendor')
-      && !rel.startsWith('dist');
+    if (rel === '') return true;
+    return !STAGING_EXCLUDES.has(rel.split(path.sep)[0]) && path.basename(rel) !== '.DS_Store';
   }
 });
 
-const vendorSource = process.env.AIDP_VENDOR_NODE_MODULES || path.join(WORKSPACE_ROOT, 'samples', 'npm-cli', 'node_modules');
-if (existsSync(vendorSource)) {
-  const vendorTarget = path.join(STAGING_PLUGIN, 'vendor', 'node_modules');
-  mkdirSync(path.dirname(vendorTarget), { recursive: true });
-  cpSync(vendorSource, vendorTarget, { recursive: true });
+const REQUIRED_VENDOR_DEPS = ['aidp-cli', 'aidp-typescript-client', 'oci-common'];
+const pluginVendorSource = path.join(PLUGIN_ROOT, 'vendor', 'node_modules');
+const vendorSource = process.env.AIDP_VENDOR_NODE_MODULES || pluginVendorSource;
+if (!existsSync(vendorSource)) {
+  throw new Error(
+    `Vendor node_modules not found. Set AIDP_VENDOR_NODE_MODULES, or provide ${pluginVendorSource}. `
+    + `The packaged plugin must bundle ${REQUIRED_VENDOR_DEPS.join(', ')}.`
+  );
 }
+const missingVendorDeps = REQUIRED_VENDOR_DEPS.filter((dep) => !existsSync(path.join(vendorSource, dep)));
+if (missingVendorDeps.length) {
+  throw new Error(`Vendor source ${vendorSource} is missing required dependencies: ${missingVendorDeps.join(', ')}.`);
+}
+const vendorTarget = path.join(STAGING_PLUGIN, 'vendor', 'node_modules');
+mkdirSync(path.dirname(vendorTarget), { recursive: true });
+cpSync(vendorSource, vendorTarget, { recursive: true });
 
 const tarPath = path.join(DIST_DIR, `${baseName}.tar.gz`);
 const zipPath = path.join(DIST_DIR, `${baseName}.zip`);
@@ -63,5 +73,5 @@ console.log(JSON.stringify({
   distDir: DIST_DIR,
   files: files.map((file) => path.relative(WORKSPACE_ROOT, file)),
   checksumFile: path.relative(WORKSPACE_ROOT, path.join(DIST_DIR, `${baseName}.sha256`)),
-  vendoredAidpCli: existsSync(vendorSource)
+  vendoredAidpCli: true
 }, null, 2));

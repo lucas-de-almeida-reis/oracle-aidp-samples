@@ -1450,7 +1450,7 @@
           "anchor": "schema-create-data-table",
           "fullName": "aidp schema create-data-table",
           "command": "create-data-table",
-          "summary": "Creates a managed table with data loaded from a sample file.",
+          "summary": "Creates a managed table with data loaded from a sample file. CSV input is read positionally: use a headerless file and _c0, _c1, ... in selectedColumns, with real names and types in tableFields.",
           "usage": "aidp schema create-data-table <AI-DATA-PLATFORM-ID> --body <JSON>",
           "bodyModel": "CreateDataTableDetails"
         },
@@ -5429,7 +5429,7 @@
       "group": "schema",
       "command": "create-data-table",
       "anchor": "schema-create-data-table",
-      "summary": "Creates a managed table with data loaded from a sample file.",
+      "summary": "Creates a managed table with data loaded from a sample file. CSV input is read positionally: use a headerless file and _c0, _c1, ... in selectedColumns, with real names and types in tableFields.",
       "usage": "aidp schema create-data-table <AI-DATA-PLATFORM-ID> --body <JSON>",
       "bodyModel": "CreateDataTableDetails",
       "bodyFields": [

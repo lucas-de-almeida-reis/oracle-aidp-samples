@@ -14,7 +14,7 @@ When the Ask AIDP MCP tools are available, prefer them over shelling out manuall
 - `aidp_check_connection`: verify workspace and optional cluster access.
 - `aidp_notebook_workflow`: create any N notebooks, create a sequential workflow, run it, export task outputs, and collect cluster logs.
 - `aidp_three_notebook_workflow`: compatibility alias for a three-notebook workflow.
-- `aidp_upload_workspace_code`: upload local code files or a directory tree to an AIDP workspace path.
+- `aidp_upload_workspace_code`: use the native TypeScript SDK `WorkspaceObjectClient` to upload local code files or a directory tree to an AIDP workspace path.
 - `aidp_create_git_folder`: connect to Git and fetch code into a Git-backed AIDP workspace folder.
 - `aidp_git_commit_push`: use the native TypeScript SDK `GitClient` to stage files, commit, and push a Git-backed workspace folder.
 - `aidp_git_pull`: use the native TypeScript SDK `GitClient` to pull remote changes into a Git-backed workspace folder.
@@ -50,7 +50,7 @@ When the Ask AIDP MCP tools are available, prefer them over shelling out manuall
 - `aidp_rest_api_reference`: summarize, search, or inspect the generated catalog of documented REST operations.
 - `aidp_rest`: make an OCI-signed request to any method/path pair in the documented REST catalog.
 
-If tools are not available, use `aidp-cli` directly with argument arrays or shell commands. For workspace Git repository push, pull, status, diff, branch, merge, rebase, and reset operations, prefer the native SDK-backed Git tools because those operations are not covered by `aidp-cli`.
+If tools are not available, use `aidp-cli` directly with argument arrays or shell commands. For workspace code upload and Git repository push, pull, status, diff, branch, merge, rebase, and reset operations, prefer the native SDK-backed tools.
 
 ## Full CLI Coverage
 
@@ -103,13 +103,13 @@ For live operations that create or update resources, write evidence to a local r
 
 When generating notebooks, organize code into focused cells with comments. Keep setup/common values together, keep related work together, and keep validation/output markers together. For SQL notebooks, preserve `%sql` as the first line of the SQL cell and use SQL comments (`-- ...`) inside that cell.
 
-For catalog/schema/table creation and lookup, prefer the dedicated convenience tools when their input shape fits. Use `aidp_list_catalogs` for "show/list/get catalogs", `aidp_get_catalog` for one catalog, `aidp_create_catalog` for general catalog creation, and `aidp_create_external_catalog` when the user specifically wants an external catalog. Use `dryRun: true` first when the user is deciding on names, keys, table columns, source type, connection properties, or sample data. Use `aidp_create_table_with_data` when the user asks to create a table and insert or load initial data into it. Be clear that this wraps `schema create-data-table` for a new managed table with an initial load; for appending to an existing table, use `aidp_cli` or a notebook/workflow if the environment exposes that operation.
+For catalog/schema/table creation and lookup, prefer the dedicated convenience tools when their input shape fits. Use `aidp_list_catalogs` for "show/list/get catalogs", `aidp_get_catalog` for one catalog, `aidp_create_catalog` for general catalog creation, and `aidp_create_external_catalog` when the user specifically wants an external catalog. Use `dryRun: true` first when the user is deciding on names, keys, table columns, source type, connection properties, or sample data. Use `aidp_create_table_with_data` when the user asks to create a table and insert or load initial data into it. Be clear that this wraps `schema create-data-table` for a new managed table with an initial load; inline rows are staged as headerless CSV with positional `selectedColumns` (`_c0`, `_c1`, ...) while `tableFields` carries the real names and types. For appending to an existing table, use `aidp_cli` or a notebook/workflow if the environment exposes that operation.
 
 For CSV-backed tables where the first row should be treated as column headers, prefer `aidp_generate_csv_table_sql` and run the generated SQL in an AIDP notebook or workflow. The generated SQL should use `USING CSV` and `OPTIONS (path '<path>', header 'true')`, matching the documented notebook SQL pattern.
 
 For workflow healing, prefer `aidp_auto_heal_workflow`. Use `dryRun: true` first unless the user clearly asks to perform the repair. If task keys are omitted, the tool selects task runs with failed/error statuses from the target job run.
 
-For workspace code, use `aidp_upload_workspace_code` for local files/directories and `aidp_create_git_folder` for Git-backed workspace folders. For Git push/pull/status/diff/branch workflows inside a Git-backed workspace folder, use the `aidp_git_*` tools; these route through the TypeScript SDK `GitClient` while the rest of the plugin remains CLI-backed. Prefer passing `gitFolderPath`; when `gitRepositoryKey` is omitted, the plugin resolves it with `WorkspaceObjectClient#listWorkspaceObjects` and the Git folder metadata `repoKey`. Use dry-run before uploading many files or performing mutating Git operations.
+For workspace code, use `aidp_upload_workspace_code` for local files/directories and `aidp_create_git_folder` for Git-backed workspace folders. Uploads route through the TypeScript SDK `WorkspaceObjectClient`; dry-run returns request placeholders without reading or base64-encoding file contents. For Git push/pull/status/diff/branch workflows inside a Git-backed workspace folder, use the `aidp_git_*` tools; these route through the TypeScript SDK `GitClient`. Prefer passing `gitFolderPath`; when `gitRepositoryKey` is omitted, the plugin resolves it with `WorkspaceObjectClient#listWorkspaceObjects` and the Git folder metadata `repoKey`. Use dry-run before uploading many files or performing mutating Git operations.
 
 For file paths in notebooks, follow AIDP Workbench file access patterns:
 

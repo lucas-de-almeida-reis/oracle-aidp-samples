@@ -5,7 +5,11 @@ A marketplace of OpenAI Codex CLI plugins for Oracle AI Data Platform (AIDP).
 ## Marketplace
 
 - **Name:** `oracle-aidp-codex`
-- **Manifest:** [`.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json)
+- **Git repository manifest:** [`.agents/plugins/marketplace.json`](../../.agents/plugins/marketplace.json)
+- **Local directory manifest:** [`.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json)
+
+The repository-root manifest supports GitHub marketplace installation. The nested
+manifest remains available when registering a local `ai/codex-plugins` checkout.
 
 ## Plugins
 
@@ -14,7 +18,7 @@ A marketplace of OpenAI Codex CLI plugins for Oracle AI Data Platform (AIDP).
 | [`oracle-ai-data-platform-workbench-databricks-migrator`](./plugins/oracle-ai-data-platform-workbench-databricks-migrator/) | 0.1.0 | Initial release | Plan and execute automated Databricks to AIDP migrations from Codex. |
 | [`oracle-ai-data-platform-workbench-engineer-agent`](./plugins/oracle-ai-data-platform-workbench-engineer-agent/) | 0.1.0+codex.20260623113518 | Initial release | Full AIDP data-engineering surface in natural language: catalog discovery, SQL analysis, AI-in-SQL, Delta operations, pipelines, clusters, governance, agent flows, MLOps, migration, and workspace administration. |
 | [`oracle-ai-data-platform-workbench-spark-connectors`](./plugins/oracle-ai-data-platform-workbench-spark-connectors/) | 0.7.0 | DB2 + Azure SQL connector guidance | Generate AIDP Spark notebook connector code for Oracle, OCI, SaaS, JDBC, object storage, streaming, REST, Excel, and multi-cloud data sources. |
-| [`ask-aidp`](./plugins/ask-aidp/) | 0.7.2 | Initial release | Ask and operate Oracle AI Data Platform resources from Codex through aidp-cli and native SDK Git tools. |
+| [`ask-aidp`](./plugins/ask-aidp/) | 0.9.1 | Current release | Ask and operate Oracle AI Data Platform resources from Codex through aidp-cli, OCI-signed REST endpoints, and native SDK tools. |
 | [`oracle-ai-data-platform-fusion-autopilot`](./plugins/oracle-ai-data-platform-fusion-autopilot/) | 0.1.0-alpha | Initial release | Build and operate curated Oracle Fusion ERP/HCM/SCM-to-AIDP medallion pipelines (BICC extracts, bronze/silver/gold content packs, guarded bootstrap/seed/incremental runs), gold marts, OAC datasets, and MCP-authored workbooks. |
 
 ## Install
@@ -24,6 +28,7 @@ Register the marketplace:
 ```bash
 codex plugin marketplace add oracle-samples/oracle-aidp-samples \
     --ref main \
+    --sparse .agents \
     --sparse ai/codex-plugins
 ```
 
@@ -43,7 +48,8 @@ Verify:
 codex plugin list
 ```
 
-Start a new Codex thread after installing or upgrading plugins.
+Restart the Codex app after installing or upgrading plugins, then start a new
+thread so the updated skills and MCP servers are loaded.
 
 ## Update
 
@@ -59,18 +65,23 @@ codex plugin add oracle-ai-data-platform-workbench-spark-connectors@oracle-aidp-
 codex plugin add ask-aidp@oracle-aidp-codex
 ```
 
+Restart the Codex app after refreshing a plugin.
+
 ## Layout
 
 ```text
-ai/codex-plugins/
+oracle-aidp-samples/
 |-- .agents/plugins/marketplace.json
-|-- README.md
-|-- TESTING.md
-`-- plugins/
-    |-- oracle-ai-data-platform-workbench-databricks-migrator/
-    |-- oracle-ai-data-platform-workbench-engineer-agent/
-    |-- oracle-ai-data-platform-workbench-spark-connectors/
-    `-- ask-aidp/
+`-- ai/codex-plugins/
+    |-- .agents/plugins/marketplace.json
+    |-- README.md
+    |-- TESTING.md
+    `-- plugins/
+        |-- oracle-ai-data-platform-workbench-databricks-migrator/
+        |-- oracle-ai-data-platform-workbench-engineer-agent/
+        |-- oracle-ai-data-platform-workbench-spark-connectors/
+        |-- ask-aidp/
+        `-- oracle-ai-data-platform-fusion-autopilot/
 ```
 
 Each plugin has its own `.codex-plugin/plugin.json`, README, license/privacy files, skills, and references or helper files.

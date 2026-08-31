@@ -114,6 +114,19 @@ while ((sectionMatch = sectionPattern.exec(markdown))) {
   });
 }
 
+const commandSummarySuffixes = new Map([
+  [
+    'aidp schema create-data-table',
+    'CSV input is read positionally: use a headerless file and _c0, _c1, ... in selectedColumns, with real names and types in tableFields.'
+  ]
+]);
+for (const command of commands) {
+  const suffix = commandSummarySuffixes.get(command.fullName);
+  if (suffix && !command.summary.includes(suffix)) {
+    command.summary = `${command.summary} ${suffix}`.trim();
+  }
+}
+
 const byFullName = new Map(commands.map((command) => [command.fullName, command]));
 for (const group of groups) {
   for (const command of group.commands) {

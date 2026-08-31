@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(__filename), '..');
 const SERVER = path.join(PLUGIN_ROOT, 'mcp', 'ask-aidp-server.mjs');
+const EXPECTED_VERSION = '0.9.1';
+const EXPECTED_TOOLS = 43;
 const args = new Set(process.argv.slice(2));
 const live = args.has('--live');
 const workflow = args.has('--workflow');
@@ -19,10 +21,109 @@ function pluginManifestTest() {
   const manifestPath = path.join(PLUGIN_ROOT, '.codex-plugin', 'plugin.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   assert(manifest.name === 'ask-aidp', 'plugin name mismatch');
+  assert(manifest.version === EXPECTED_VERSION, `plugin version mismatch: expected ${EXPECTED_VERSION}, got ${manifest.version}`);
   assert(manifest.mcpServers === './.mcp.json', 'missing mcpServers manifest entry');
   assert(existsSync(path.join(PLUGIN_ROOT, '.mcp.json')), 'missing .mcp.json');
   assert(existsSync(SERVER), 'missing MCP server');
   assert(existsSync(path.join(PLUGIN_ROOT, 'skills', 'ask-aidp', 'SKILL.md')), 'missing skill');
+}
+
+function mcpConfigTest() {
+  const config = JSON.parse(readFileSync(path.join(PLUGIN_ROOT, '.mcp.json'), 'utf8'));
+  const server = config?.mcpServers?.['ask-aidp'];
+  assert(server, '.mcp.json must use the wrapped mcpServers.ask-aidp format');
+  assert(server.command === 'node', `.mcp.json command should be node, got ${server.command}`);
+  assert(server.cwd === '.', `.mcp.json cwd should be ".", got ${server.cwd}`);
+  const serverArgs = server.args || [];
+  assert(
+    serverArgs.some((arg) => arg.includes('mcp/ask-aidp-server.mjs')),
+    '.mcp.json args must point at mcp/ask-aidp-server.mjs'
+  );
+  for (const arg of serverArgs) {
+    assert(!path.isAbsolute(arg), `.mcp.json args must stay relative, got absolute ${arg}`);
+  }
+}
+
+function marketplaceManifestTest() {
+  const nestedRoot = path.resolve(PLUGIN_ROOT, '..', '..');
+  const repositoryRoot = path.resolve(PLUGIN_ROOT, '..', '..', '..', '..');
+  const nestedPath = path.join(nestedRoot, '.agents', 'plugins', 'marketplace.json');
+  const repositoryPath = path.join(repositoryRoot, '.agents', 'plugins', 'marketplace.json');
+  const hasNestedManifest = existsSync(nestedPath);
+  const hasRepositoryManifest = existsSync(repositoryPath);
+
+  // Packaged and installed plugin copies do not include either marketplace root.
+  if (!hasNestedManifest && !hasRepositoryManifest) return;
+  assert(hasNestedManifest, 'repository checkout is missing the nested ai/codex-plugins marketplace manifest');
+  assert(hasRepositoryManifest, 'repository checkout is missing the repository-root marketplace manifest');
+
+  const loadManifest = (manifestPath, marketplaceRoot, label) => {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    assert(manifest.name === 'oracle-aidp-codex', `unexpected ${label} marketplace name: ${manifest.name}`);
+    assert(Array.isArray(manifest.plugins), `${label} marketplace plugins must be an array`);
+
+    const resolvedPlugins = new Map();
+    for (const entry of manifest.plugins) {
+      assert(entry?.name, `${label} marketplace contains a plugin without a name`);
+      assert(!resolvedPlugins.has(entry.name), `${label} marketplace contains duplicate plugin ${entry.name}`);
+      assert(entry.source?.source === 'local', `${label} marketplace plugin ${entry.name} should use a local source`);
+      const resolved = path.resolve(marketplaceRoot, entry.source.path || '.');
+      assert(
+        existsSync(path.join(resolved, '.codex-plugin', 'plugin.json')),
+        `${label} marketplace plugin ${entry.name} path ${entry.source.path} does not resolve to a Codex plugin`
+      );
+      resolvedPlugins.set(entry.name, resolved);
+    }
+    return { manifest, resolvedPlugins };
+  };
+
+  const nested = loadManifest(nestedPath, nestedRoot, 'nested');
+  const repository = loadManifest(repositoryPath, repositoryRoot, 'repository-root');
+  const nestedPlugins = nested.resolvedPlugins;
+  const repositoryPlugins = repository.resolvedPlugins;
+  const nestedNames = [...nestedPlugins.keys()].sort();
+  const repositoryNames = [...repositoryPlugins.keys()].sort();
+  assert(
+    JSON.stringify(nestedNames) === JSON.stringify(repositoryNames),
+    'repository-root and nested marketplace manifests must list the same plugins'
+  );
+  assert(
+    JSON.stringify(nested.manifest.interface) === JSON.stringify(repository.manifest.interface),
+    'repository-root and nested marketplace interfaces must match'
+  );
+  for (const pluginName of nestedNames) {
+    const nestedEntry = nested.manifest.plugins.find((entry) => entry.name === pluginName);
+    const repositoryEntry = repository.manifest.plugins.find((entry) => entry.name === pluginName);
+    assert(
+      nestedPlugins.get(pluginName) === repositoryPlugins.get(pluginName),
+      `repository-root and nested marketplace entries for ${pluginName} must resolve to the same plugin`
+    );
+    assert(
+      nestedEntry.category === repositoryEntry.category &&
+        JSON.stringify(nestedEntry.policy) === JSON.stringify(repositoryEntry.policy),
+      `repository-root and nested marketplace metadata for ${pluginName} must match`
+    );
+  }
+  assert(nestedPlugins.get('ask-aidp') === PLUGIN_ROOT, 'marketplace ask-aidp entries must resolve to this plugin');
+}
+
+function symlinkTest() {
+  const problems = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = readlinkSync(full);
+        const rel = path.relative(PLUGIN_ROOT, full);
+        if (path.isAbsolute(target)) problems.push(`absolute: ${rel} -> ${target}`);
+        else if (!existsSync(path.resolve(path.dirname(full), target))) problems.push(`broken: ${rel} -> ${target}`);
+      } else if (entry.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  walk(PLUGIN_ROOT);
+  assert(problems.length === 0, `non-portable symlinks: ${problems.slice(0, 10).join('; ')}`);
 }
 
 function startServer(extraEnv = {}) {
@@ -37,13 +138,20 @@ function startServer(extraEnv = {}) {
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
   let nextId = 1;
   const pending = new Map();
+  const nonJsonLines = [];
   const timer = setInterval(() => {
     let index;
     while ((index = stdout.indexOf('\n')) >= 0) {
       const line = stdout.slice(0, index);
       stdout = stdout.slice(index + 1);
       if (!line.trim()) continue;
-      const message = JSON.parse(line);
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        nonJsonLines.push(line.slice(0, 200));
+        continue;
+      }
       if (pending.has(message.id)) {
         const { resolve, reject } = pending.get(message.id);
         pending.delete(message.id);
@@ -68,6 +176,9 @@ function startServer(extraEnv = {}) {
         });
       });
     },
+    nonJsonLines() {
+      return nonJsonLines;
+    },
     stop() {
       clearInterval(timer);
       child.stdin.end();
@@ -82,16 +193,29 @@ function toolText(result) {
 
 async function main() {
   pluginManifestTest();
+  mcpConfigTest();
+  marketplaceManifestTest();
+  symlinkTest();
   const env = {};
   const localAidp = path.resolve(PLUGIN_ROOT, '..', '..', 'samples', 'npm-cli', 'node_modules', '.bin', process.platform === 'win32' ? 'aidp.cmd' : 'aidp');
   if (!process.env.AIDP_CLI_BIN && existsSync(localAidp)) env.AIDP_CLI_BIN = localAidp;
 
   const server = startServer(env);
   try {
-    const init = await server.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'ask-aidp-qa', version: '0.9.0' } });
+    const init = await server.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'ask-aidp-qa', version: EXPECTED_VERSION } });
     assert(init.serverInfo.name === 'ask-aidp', 'server did not initialize as ask-aidp');
+    assert(init.serverInfo.version === EXPECTED_VERSION, `server version mismatch: expected ${EXPECTED_VERSION}, got ${init.serverInfo.version}`);
 
     const list = await server.request('tools/list');
+    assert(
+      list.tools.length === EXPECTED_TOOLS,
+      `tools/list returned ${list.tools.length} tools, expected ${EXPECTED_TOOLS}`
+    );
+    const tableWithDataTool = list.tools.find((tool) => tool.name === 'aidp_create_table_with_data');
+    assert(
+      tableWithDataTool?.inputSchema?.properties?.csvIncludeHeader?.const === false,
+      'aidp_create_table_with_data must reject CSV headers because create-data-table reads positionally'
+    );
     const names = list.tools.map((tool) => tool.name);
     for (const name of [
       'aidp_cli',
@@ -226,6 +350,18 @@ async function main() {
     assert(!uploadDryRun.isError, `upload dry run failed: ${toolText(uploadDryRun)}`);
     const uploadPlan = JSON.parse(toolText(uploadDryRun));
     assert(uploadPlan.entryCount === 1, 'upload dry run expected one file');
+    assert(
+      uploadPlan.implementation === 'aidp-typescript-client WorkspaceObjectClient#createWorkspaceObject',
+      'upload dry run should use the WorkspaceObjectClient implementation'
+    );
+    assert(
+      uploadPlan.entries[0].request.aiDataPlatformId === '<aiDataPlatformId>',
+      'upload dry run should use an instance ID placeholder when only workspaceKey is configured'
+    );
+    assert(
+      uploadPlan.entries[0].request.createWorkspaceObjectDetails.startsWith('<base64:'),
+      'upload dry run should return a base64 placeholder instead of file contents'
+    );
 
     const globDir = path.join(PLUGIN_ROOT, 'qa-runs', 'glob-top-level');
     rmSync(globDir, { recursive: true, force: true });
@@ -519,8 +655,18 @@ async function main() {
     assert(tableWithDataPlan.command.includes('schema create-data-table'), 'table with data command mismatch');
     assert(tableWithDataPlan.body.managedTableDefinition.managedTableDataFormat === 'DELTA', 'table with data managed format mismatch');
     assert(tableWithDataPlan.body.fileFormat === 'CSV', 'table with data file format mismatch');
-    assert(tableWithDataPlan.body.selectedColumns.includes('amount'), 'table with data selected columns mismatch');
-    assert(/id,amount,status/.test(tableWithDataPlan.dataPreview), 'table with data CSV preview mismatch');
+    assert(
+      JSON.stringify(tableWithDataPlan.body.selectedColumns) === JSON.stringify(['_c0', '_c1', '_c2']),
+      'table with data selected columns should be positional (_c0/_c1/_c2) for headerless inline rows'
+    );
+    assert(
+      tableWithDataPlan.body.tableFields.some((field) => field.fieldName === 'amount'),
+      'table with data tableFields should carry the amount column name'
+    );
+    assert(
+      /(^|\n)1,10\.5,new(\n|$)/.test(tableWithDataPlan.dataPreview) && !/id,amount,status/.test(tableWithDataPlan.dataPreview),
+      'table with data CSV preview should be headerless data rows'
+    );
 
     const csvTableSql = await server.request('tools/call', {
       name: 'aidp_generate_csv_table_sql',
@@ -676,6 +822,9 @@ async function main() {
       assert(summary.taskRuns.length === 3, 'workflow did not return three task runs');
       writeFileSync(path.join(PLUGIN_ROOT, 'qa-live-result.json'), JSON.stringify(summary, null, 2));
     }
+
+    const stray = server.nonJsonLines();
+    assert(stray.length === 0, `non-JSON output on stdout: ${stray.slice(0, 5).join(' | ')}`);
   } finally {
     server.stop();
   }

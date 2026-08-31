@@ -10,7 +10,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const SERVER_VERSION = '0.9.0';
+const SERVER_VERSION = '0.9.1';
 const SERVER_NAME = 'ask-aidp';
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(path.dirname(__filename), '..');
@@ -724,7 +724,12 @@ const TOOLS = [
             }
           ]
         },
-        csvIncludeHeader: { type: 'boolean', default: true },
+        csvIncludeHeader: {
+          type: 'boolean',
+          const: false,
+          default: false,
+          description: 'Deprecated compatibility input. Inline-row CSV must remain headerless because create-data-table reads columns positionally.'
+        },
         uploadMethod: { type: 'string', enum: ['PUT', 'POST'], default: 'PUT' },
         uploadContentType: { type: 'string', description: 'Optional content type for staged local data upload.' },
         uploadTargetBaseUrl: { type: 'string', description: 'Optional base object storage URL if AIDP returns a relative tempFileUploadTarget.' },
@@ -1358,6 +1363,22 @@ function sdkResponseToJson(response) {
   }, 2);
 }
 
+function sdkErrorStatus(error) {
+  return error?.statusCode ?? error?.status ?? error?.response?.status;
+}
+
+function isConflictError(error) {
+  return sdkErrorStatus(error) === 409 || /already exists/i.test(error?.message || '');
+}
+
+function sdkErrorToJson(error) {
+  return {
+    message: error?.message || String(error),
+    statusCode: sdkErrorStatus(error),
+    code: error?.code || error?.serviceCode
+  };
+}
+
 function sdkDryRun(operation, request) {
   return toolText(JSON.stringify({
     dryRun: true,
@@ -1441,17 +1462,49 @@ function normalizeSpawnTarget(command, args) {
   if (process.platform !== 'win32') return { command, args };
   const lower = command.toLowerCase();
   if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) return { command, args };
-  return {
-    command: process.env.ComSpec || 'cmd.exe',
-    args: ['/d', '/s', '/c', [quoteWindowsCmdArg(command), ...args.map(quoteWindowsCmdArg)].join(' ')]
-  };
+  // SECURITY: never invoke a .cmd/.bat shim through cmd.exe with interpolated
+  // arguments. cmd.exe's quoting cannot be made safe for a value containing a
+  // double-quote — it terminates the quoted region and drops back to unquoted
+  // parsing where &, |, > become command separators (RCE; CVE-2024-27980 /
+  // "BatBadBut" class). Instead resolve the shim to the Node script it wraps
+  // and spawn Node directly with an argv ARRAY (shell:false), so every
+  // metacharacter — the double-quote included — is passed as inert literal
+  // data. Fail closed if the underlying script can't be resolved.
+  const script = resolveCmdShimToNode(command);
+  if (script) return { command: process.execPath, args: [script, ...args] };
+  throw new Error(
+    `Refusing to execute the aidp CLI via the Windows shim ${command}: arguments ` +
+    `cannot be passed safely through cmd.exe. Point AIDP_CLI_BIN at the aidp Node ` +
+    `entry script (…/aidp-cli/dist/bin/aidp.js) or the platform binary instead.`
+  );
 }
 
-function quoteWindowsCmdArg(value) {
-  const text = String(value);
-  if (text === '') return '""';
-  if (!/[\s"&()<>^|%]/.test(text)) return text;
-  return `"${text.replace(/(["^&|<>()%])/g, '^$1')}"`;
+function resolveCmdShimToNode(cmdPath) {
+  // npm/pnpm/yarn .cmd/.bat shims launch Node against a wrapped .js entry, but
+  // the exact spelling of that path varies by generator/version — all of these
+  // occur in the wild:
+  //   "%~dp0\node_modules\aidp-cli\dist\bin\aidp.js"   (older npm)
+  //   "%dp0%\..\aidp-cli\dist\bin\aidp.js"             (current npm; dp0 var + relative ..)
+  //   "%~dp0../aidp-cli/dist/bin/aidp.js"              (forward slashes)
+  // Extract EVERY .js token, strip the dp0 directory variable, resolve what
+  // remains against the shim's own directory (honouring `..`), and return the
+  // first path that exists. Bypassing cmd.exe entirely is the whole point
+  // (see normalizeSpawnTarget); resolving Node's real entry robustly is what
+  // keeps the normal Windows aidp.cmd install working after that change.
+  let text;
+  try { text = readFileSync(cmdPath, 'utf8'); } catch { return null; }
+  const dir = path.dirname(cmdPath);
+  const tokens = text.match(/[^\s"'\r\n]+\.js\b/gi) || [];
+  for (const token of tokens) {
+    // Strip a leading dp0 directory variable in any of its spellings:
+    // %~dp0 , %dp0% , %dp0  — optionally followed by a path separator.
+    let rel = token.replace(/^%~?dp0%?[\\/]?/i, '');
+    if (rel.includes('%')) continue;             // still carries an unresolved %VAR% — skip
+    rel = rel.replace(/[\\/]+/g, path.sep);
+    const resolved = path.isAbsolute(rel) ? rel : path.resolve(dir, rel);
+    if (existsSync(resolved)) return resolved;
+  }
+  return null;
 }
 
 function parseCliJson(result) {
@@ -2187,7 +2240,7 @@ async function createTableWithData(input) {
     throw new Error('Inline rows are staged as CSV. Use localDataFile or objectStorageLocationPath for non-CSV fileFormat values.');
   }
 
-  const body = buildCreateDataTableBody(input, source.objectStorageLocationPath || '<generated-oci-file-path>', fileFormat);
+  const body = buildCreateDataTableBody(input, source.objectStorageLocationPath || '<generated-oci-file-path>', fileFormat, source.kind);
   const command = scrubCommand(['schema', 'create-data-table', '--body', '@<generated-json>', ...commonFlags(config)]);
 
   if (input.dryRun === true) {
@@ -2206,7 +2259,7 @@ async function createTableWithData(input) {
           },
       command,
       body,
-      dataPreview: source.kind === 'rows' ? truncate(rowsToCsv(input.rows, body.selectedColumns, input.csvIncludeHeader !== false), 2000) : undefined
+      dataPreview: source.kind === 'rows' ? truncate(rowsToCsv(input.rows, dataColumnsFor(input), false), 2000) : undefined
     }, null, 2));
   }
 
@@ -2218,7 +2271,7 @@ async function createTableWithData(input) {
     if (!objectStorageLocationPath) {
       tempDir = await mkdtemp(path.join(tmpdir(), 'ask-aidp-data-'));
       const dataFile = source.kind === 'rows'
-        ? writeRowsDataFile(input, body.selectedColumns, tempDir)
+        ? writeRowsDataFile(input, dataColumnsFor(input), tempDir)
         : validateLocalDataFile(input.localDataFile, input.maxUploadBytes || 10485760);
 
       const uploadTarget = await runAidp(['schema', 'generate-temp-file-upload-target', input.schemaKey], {
@@ -2255,7 +2308,7 @@ async function createTableWithData(input) {
       };
     }
 
-    const createBody = buildCreateDataTableBody(input, objectStorageLocationPath, fileFormat);
+    const createBody = buildCreateDataTableBody(input, objectStorageLocationPath, fileFormat, source.kind);
     const create = await runGeneratedJsonCommand(['schema', 'create-data-table'], createBody, config, input.timeoutSeconds || 120);
     const response = {
       created: create.exitCode === 0,
@@ -2558,12 +2611,25 @@ function normalizeDataTableField(field, rows = []) {
   return normalized;
 }
 
-function buildCreateDataTableBody(input, objectStorageLocationPath, fileFormat) {
+function dataColumnsFor(input) {
   const rows = Array.isArray(input.rows) ? input.rows : [];
   const tableFields = buildDataTableFields(input, rows);
-  const selectedColumns = input.selectedColumns?.length
+  return input.selectedColumns?.length
     ? input.selectedColumns
     : tableFields.map((field) => field.fieldName);
+}
+
+function positionalColumns(count) {
+  return Array.from({ length: count }, (_, index) => `_c${index}`);
+}
+
+function buildCreateDataTableBody(input, objectStorageLocationPath, fileFormat, sourceKind) {
+  const rows = Array.isArray(input.rows) ? input.rows : [];
+  const tableFields = buildDataTableFields(input, rows);
+  const dataColumns = dataColumnsFor(input);
+  const selectedColumns = sourceKind === 'rows'
+    ? positionalColumns(dataColumns.length)
+    : dataColumns;
   const body = {
     catalogKey: requireValue(input.catalogKey, 'catalogKey'),
     schemaKey: requireValue(input.schemaKey, 'schemaKey'),
@@ -2648,8 +2714,8 @@ function csvCell(value) {
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-function writeRowsDataFile(input, selectedColumns, tempDir) {
-  const csv = rowsToCsv(input.rows, selectedColumns, input.csvIncludeHeader !== false);
+function writeRowsDataFile(input, dataColumns, tempDir) {
+  const csv = rowsToCsv(input.rows, dataColumns, false);
   const bytes = Buffer.byteLength(csv);
   const maxUploadBytes = input.maxUploadBytes || 10485760;
   if (bytes > maxUploadBytes) throw new Error(`Generated CSV is ${bytes} bytes, exceeding maxUploadBytes=${maxUploadBytes}.`);
@@ -2829,13 +2895,6 @@ function walkUploadDirectory(root, current, workspaceRoot, entries, options) {
       entries.push({ kind: 'file', localPath: fullPath, relativePath: rel, workspacePath });
     }
   }
-}
-
-function uploadEntryCommand(workspaceKey, entry, overwrite, config) {
-  const args = entry.kind === 'folder'
-    ? ['workspace-object', 'create', workspaceKey, '--path', entry.workspacePath, '--type', 'FOLDER', '--is-overwrite', String(overwrite), '--body', '{}']
-    : ['workspace-object', 'create', workspaceKey, '--path', entry.workspacePath, '--type', 'FILE', '--is-overwrite', String(overwrite), '--body', `@${entry.localPath}`];
-  return scrubCommand([...args, ...commonFlags(config)]);
 }
 
 function normalizeWorkspacePath(value) {
@@ -3127,26 +3186,62 @@ async function uploadWorkspaceCode(input) {
   const config = workflowConfig(input.config || {});
   const workspaceKey = requireValue(config.workspaceKey, 'workspaceKey or AIDP_WORKSPACE_KEY');
   const entries = buildUploadEntries(input);
-  const commands = entries.map((entry) => uploadEntryCommand(workspaceKey, entry, input.overwrite !== false, config));
+  const overwrite = input.overwrite !== false;
+
+  const buildRequest = (entry) => {
+    const isFolder = entry.kind === 'folder';
+    return {
+      aiDataPlatformId: requireValue(config.instanceId, 'instanceId, AIDP_OCID, or AIDP_INSTANCE_ID'),
+      workspaceKey,
+      path: entry.workspacePath,
+      type: isFolder ? 'FOLDER' : 'FILE',
+      isOverwrite: overwrite,
+      isUploadFileBase64Encoded: !isFolder,
+      createWorkspaceObjectDetails: isFolder ? '{}' : readFileSync(entry.localPath).toString('base64')
+    };
+  };
 
   if (input.dryRun === true) {
     return toolText(JSON.stringify({
       dryRun: true,
+      implementation: 'aidp-typescript-client WorkspaceObjectClient#createWorkspaceObject',
       localPath: path.resolve(input.localPath),
       workspacePath: input.workspacePath,
       entryCount: entries.length,
-      entries: entries.map((entry, index) => ({ ...entry, command: commands[index] }))
+      entries: entries.map((entry) => ({
+        ...entry,
+        operation: 'WorkspaceObjectClient#createWorkspaceObject',
+        request: {
+          aiDataPlatformId: config.instanceId || '<aiDataPlatformId>',
+          workspaceKey,
+          path: entry.workspacePath,
+          type: entry.kind === 'folder' ? 'FOLDER' : 'FILE',
+          isOverwrite: overwrite,
+          isUploadFileBase64Encoded: entry.kind !== 'folder',
+          createWorkspaceObjectDetails: entry.kind === 'folder' ? '{}' : `<base64:${entry.localPath}>`
+        }
+      }))
     }, null, 2));
   }
 
+  const client = await createWorkspaceObjectClient(config);
   const results = [];
-  for (const entry of entries) {
-    const args = entry.kind === 'folder'
-      ? ['workspace-object', 'create', workspaceKey, '--path', entry.workspacePath, '--type', 'FOLDER', '--is-overwrite', String(input.overwrite !== false), '--body', '{}']
-      : ['workspace-object', 'create', workspaceKey, '--path', entry.workspacePath, '--type', 'FILE', '--is-overwrite', String(input.overwrite !== false), '--body', `@${entry.localPath}`];
-    const result = await runAidp(args, { config, timeoutSeconds: input.timeoutSeconds || 120 });
-    results.push({ entry, command: result.command, exitCode: result.exitCode, response: safeData(result) });
-    if (result.exitCode !== 0) return toolText(JSON.stringify({ uploaded: false, results }, null, 2), true);
+  try {
+    for (const entry of entries) {
+      try {
+        const response = await client.createWorkspaceObject(buildRequest(entry));
+        results.push({ entry, operation: 'WorkspaceObjectClient#createWorkspaceObject', response: JSON.parse(sdkResponseToJson(response)) });
+      } catch (error) {
+        if (entry.kind === 'folder' && isConflictError(error)) {
+          results.push({ entry, operation: 'WorkspaceObjectClient#createWorkspaceObject', skipped: 'folder already exists' });
+          continue;
+        }
+        results.push({ entry, operation: 'WorkspaceObjectClient#createWorkspaceObject', error: sdkErrorToJson(error) });
+        return toolText(JSON.stringify({ uploaded: false, results }, null, 2), true);
+      }
+    }
+  } finally {
+    client.close?.();
   }
 
   return toolText(JSON.stringify({ uploaded: true, entryCount: entries.length, results }, null, 2));

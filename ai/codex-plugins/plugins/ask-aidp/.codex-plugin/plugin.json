@@ -1,6 +1,6 @@
 {
   "name": "ask-aidp",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Ask and operate Oracle AI Data Platform resources from Codex through aidp-cli, signed REST, and native SDK Git tools.",
   "author": {
     "name": "Oracle",
