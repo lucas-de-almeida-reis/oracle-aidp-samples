@@ -26,8 +26,9 @@ region: us-ashburn-1
 oci_credential_prefix: demo_oci
 
 # --- ADW fleet ---
-# One prefix per ADW. Each expects four credentials:
-#   <prefix>_dsn  <prefix>_wallet_zip  <prefix>_pwd  <prefix>_wallet_pwd
+# One prefix per ADW. Each expects:
+#   <prefix>_dsn  <prefix>_pwd                      always
+#   <prefix>_wallet_zip  <prefix>_wallet_pwd        only when flags.use_wallet is true
 #
 # _wallet_zip accepts 'oci://<bucket>@<namespace>/<object>' - preferred, because
 # provisioning becomes a CLI or Terraform call - or an AIDP Volume path.
@@ -37,10 +38,23 @@ adw_prefixes:
   - demo_adw1
   - demo_adw2
 
-# Administrative user. One value for the whole fleet, or a list with one per ADW
-# in the same order as adw_prefixes. It lives HERE and not in the Vault: it is not
-# a secret, and the AIDP masking layer would redact "ADMIN" throughout the
-# notebook output, including SELECT user FROM dual and every error message.
+# Administrative user. Two shapes:
+#
+#   adw_user: ADMIN          a single value, used on every ADW
+#
+#   adw_user:                per ADW, keyed by the prefix. Prefixes not listed fall
+#     pb_adw1: SYNC_ADMIN    back to ADMIN; an unknown key is rejected, because a typo
+#     pb_adw2: ADMIN         would otherwise silently connect as the wrong user.
+#
+# A positional list is refused: it rebinds users to the wrong ADWs as soon as
+# adw_prefixes is reordered, and nothing in the run would show it.
+#
+# This lives HERE and not in the Vault: it is not a secret, and the AIDP masking layer
+# would redact "ADMIN" throughout the notebook output, including SELECT user FROM dual
+# and every error message.
+#
+# Using a NON-ADMIN user? See registry_table below - the default points into the ADMIN
+# schema and is the first thing that breaks.
 adw_user: ADMIN
 
 # --- Naming ---
@@ -64,6 +78,11 @@ flags:
   force_snapshot: false
   retry_failed: true      # one retry before writing the registry
   bulk_discovery: true    # bulk listing through the Object Storage SDK
+  # mTLS wallet, fleet-wide. Set false ONLY when every ADB has mutual TLS set to NOT
+  # required; each <prefix>_dsn must then be the TLS connection string from the console,
+  # not the mTLS descriptor. With false, the two wallet secrets are not read at all -
+  # 4 credentials per ADW become 2 - and the wallet bucket becomes unnecessary.
+  use_wallet: true
 
 # --- Parallelism ---
 # Connections per run = min(fleet size, adw_workers_cap) x workers
@@ -85,6 +104,13 @@ discovery:
     - default
 
 # --- Infrastructure ---
+# Sync state, one row per (catalog, owner, table). Created and written by the ADMINISTRATIVE
+# connection, so the schema qualifier decides which privileges that user needs:
+#   ADMIN.EXT_REGISTRY_V4   only correct when adw_user really is ADMIN. Any other user needs
+#                           CREATE ANY TABLE plus SELECT/INSERT/UPDATE/DELETE ANY TABLE.
+#   EXT_REGISTRY_V4         unqualified - resolves to each ADW's own adw_user schema. This is
+#                           the right choice for a non-ADMIN user, and works per ADW even when
+#                           the fleet uses different users.
 registry_table: ADMIN.EXT_REGISTRY_V4
 acl_privileges:
   - connect
