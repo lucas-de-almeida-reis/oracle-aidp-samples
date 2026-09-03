@@ -49,9 +49,7 @@ adw_prefixes:
 # A positional list is refused: it rebinds users to the wrong ADWs as soon as
 # adw_prefixes is reordered, and nothing in the run would show it.
 #
-# This lives HERE and not in the Vault: it is not a secret, and the AIDP masking layer
-# would redact "ADMIN" throughout the notebook output, including SELECT user FROM dual
-# and every error message.
+# This lives HERE and not in the Vault: it is configuration, not a secret.
 #
 # ADMIN is the recommended default. A dedicated user buys credential separation and
 # cleaner audit, NOT less privilege: this job needs CREATE USER and ALTER USER, and

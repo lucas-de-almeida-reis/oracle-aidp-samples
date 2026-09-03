@@ -153,10 +153,7 @@ allow any-user to read objects in compartment id <COMPARTMENT_OCID> where all { 
 You need a Vault with a master encryption key. In **Identity & Security -> Vault -> your vault
 -> Secrets -> Create Secret**, create one secret per value below.
 
-**One secret holds one value. Never a JSON document with several fields.** The AIDP masking
-layer redacts exactly the string that `secrets.get()` returned, so a pure value shows up as
-`[REDACTED]` if it is ever printed by accident. A value parsed out of a JSON blob would leak
-into the notebook output in clear.
+**One secret holds one value. Never a JSON document with several fields.**
 
 **Service account secrets** - four, sharing a prefix of your choice. `demo_oci` is used throughout
 this documentation:
@@ -194,13 +191,9 @@ Repeat for `demo_adw2`, `demo_adw3` and so on.
 
 At two ADWs that is **12 secrets**: 4 for the service account plus 4 per ADW.
 
-**What must NOT become a secret.** The masking layer redacts any exact occurrence of a value
-that passed through `secrets.get()`. Storing short, common values poisons the entire log: with
-`ADMIN` in the vault, `SELECT user FROM dual`, error messages and `all_users` listings all print
-as `[REDACTED]` and the notebook becomes impossible to debug. So the ADW administrative user
-name lives in `adw_sync.yaml` under `adw_user`, and the ADW display name is derived from the
-prefix. Rule of thumb: **a short, common value, or one that appears in logs, does not belong in
-the vault.**
+**What must NOT become a secret.** The ADW administrative user name is not a secret: it lives
+in `adw_sync.yaml` under `adw_user`, and the ADW display name is derived from the prefix. Rule of
+thumb: **a short, common value, or one that appears in logs, does not belong in the vault.**
 
 The wallet **files** do not belong there either - they exceed the 25 KB secret limit. Only the
 path and the password go to the Vault.
@@ -562,7 +555,6 @@ protections are in `ARCHITECTURE.md`, section 7.
 | `ORA-01017` intermittently | two jobs with work in the same schema rotating the password under each other. Run catalogs sequentially |
 | `ORA-06564: DATA_PUMP_DIR` | the `GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR` was removed. It is required for reads too |
 | `ORA-12838` | `ALTER SESSION DISABLE PARALLEL DML` did not run. Check `_prep` |
-| Everything prints as `[REDACTED]` | a short, common value was stored in the Vault. Never put `ADMIN` or similar there |
 
 ---
 

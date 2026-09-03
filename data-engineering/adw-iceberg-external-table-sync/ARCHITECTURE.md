@@ -552,8 +552,8 @@ minutes. Treat it as a deliberate, per-run choice.
 | Fingerprint from Iceberg metadata, not from Spark | no per-table Spark call; discovery drops from ~2h to ~30s |
 | Registry keyed by catalog | lets catalogs share an ADW without cross-deletion |
 | Schema prefix fixed, not configurable | the protection cannot be switched off by accident |
-| One secret holds one value, never JSON | the masking layer redacts the exact returned string; a value parsed out of JSON would leak into notebook output |
-| Short, common values stay OUT of the Vault | with `ADMIN` in the Vault, every `SELECT user`, error message and `all_users` listing prints as `[REDACTED]` |
+| One secret holds one value, never JSON | one value per secret keeps rotation and auditing per credential |
+| Short, common values stay OUT of the Vault | they are not secrets, and the Vault is not the place for configuration |
 | Wallets in a bucket, not a Volume | provisioning becomes a CLI or Terraform call; several AIDP instances share one fleet |
 | Discovery shields unreadable tables from DROP | a transient read failure must never delete a healthy external table |
 | Registry written after the work, only for successes | an interrupted run converges instead of lying |
