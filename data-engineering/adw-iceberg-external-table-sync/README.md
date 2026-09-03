@@ -422,22 +422,45 @@ ALTER USER <user> QUOTA UNLIMITED ON DATA;
 
 With those two, a user holding only `CREATE SESSION` and `PDB_DBA` drives the sync end to end.
 
-### Is there a smaller role than `PDB_DBA`?
+### Is there a role that covers everything?
 
-No. Measured on ADB 23ai, these are the roles carrying each privilege the job needs:
+**No - not even `DBA`.** Measured on ADB 23ai by granting each role to a bare user and running
+every check:
 
-| Privilege | Roles that grant it |
+| Granted | Result |
 |---|---|
-| `CREATE USER`, `ALTER USER`, `DROP USER` | `DBA`, `PDB_DBA`, `DV_ACCTMGR`, `OML_SYS_ADMIN`, `IMP_FULL_DATABASE`, `DATAPUMP_CLOUD_IMP` |
-| `GRANT ANY OBJECT PRIVILEGE` | `DBA`, `PDB_DBA`, `IMP_FULL_DATABASE`, `DATAPUMP_IMP_FULL_DATABASE`, `DATAPUMP_CLOUD_IMP` |
-| `EXECUTE ON DBMS_NETWORK_ACL_ADMIN` | `DBA`, `PDB_DBA`, `EXECUTE_CATALOG_ROLE` |
+| `DBA` only | 10 / 11 - fails `GRANT EXECUTE ON DBMS_CLOUD` with `ORA-01031` |
+| `PDB_DBA` only | 9 / 11 - same failure, plus `ORA-01950` (no tablespace quota) |
 
-Only `DBA` and `PDB_DBA` cover all three. The datapump import roles come close but also carry
-`GRANT ANY PRIVILEGE`, which `PDB_DBA` does not - they are a **wider** grant, not a narrower one.
-`DV_ACCTMGR` and `OML_SYS_ADMIN` manage users but reach neither the object privileges nor the ACL.
+`GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION` **cannot come from any role**, and the
+reason is structural:
 
-**The smaller option is no role at all.** These twelve explicit grants pass every check, with the
-user holding zero roles:
+- `DBMS_CLOUD` is a public synonym for a package owned by the **common** user
+  `C##CLOUD$SERVICE`, living at CDB level;
+- `GRANT ANY OBJECT PRIVILEGE` - which both `DBA` and `PDB_DBA` carry - does not reach a common
+  object from inside the PDB;
+- no role in the database holds that `EXECUTE` as grantable. `DWROLE`, `GRAPH_DEVELOPER` and
+  `OSAK_ADMIN_ROLE` hold it with `GRANTABLE = NO`, so they can *use* `DBMS_CLOUD` but not pass it
+  on - and passing it on is exactly what the job does for every schema it provisions;
+- `ADMIN` works only because Oracle grants it **directly**, per versioned package, with
+  `GRANTABLE = YES`, at provisioning time.
+
+Likewise **no role can supply the tablespace quota**: no role in the database holds
+`UNLIMITED TABLESPACE`, because quota is a per-user attribute, not a privilege.
+
+So there is no "grant one role and go" option. The realistic choices:
+
+| Approach | Extra grants needed | Scope handed over |
+|---|---|---|
+| `DBA` | `EXECUTE ON DBMS_CLOUD ... WITH GRANT OPTION` | the whole database |
+| `PDB_DBA` | the same, plus `QUOTA UNLIMITED ON DATA` | 30 nested roles, 275 system and 43,662 object privileges |
+| Explicit grants, no role | all twelve below | 9 system and 3 object privileges |
+
+`PDB_DBA` plus two grants is the pragmatic middle: strictly less than `DBA`, and one line longer.
+
+### Least privilege: no role at all
+
+Twelve explicit grants pass every check with the user holding zero roles:
 
 ```sql
 CREATE USER <user> IDENTIFIED BY "<password>";
@@ -458,17 +481,6 @@ GRANT EXECUTE ON DBMS_NETWORK_ACL_ADMIN TO <user>;
 
 Every `WITH ADMIN OPTION` / `WITH GRANT OPTION` above exists because the job **passes that
 privilege on** to each schema it provisions - not because the job needs it more broadly.
-
-The difference is not marginal:
-
-| | Nested roles | System privileges | Object privileges |
-|---|---|---|---|
-| `DBA` | 16 | 288 | 6,370 |
-| `PDB_DBA` | 30 | 275 | 43,662 |
-| **Explicit set above** | **0** | **9** | **3** |
-
-`PDB_DBA` is convenient, not minimal. Use it to get running; use the explicit set when the grant
-has to survive a security review.
 
 ### The full privilege list
 
