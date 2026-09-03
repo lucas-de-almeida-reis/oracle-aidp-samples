@@ -422,6 +422,54 @@ ALTER USER <user> QUOTA UNLIMITED ON DATA;
 
 With those two, a user holding only `CREATE SESSION` and `PDB_DBA` drives the sync end to end.
 
+### Is there a smaller role than `PDB_DBA`?
+
+No. Measured on ADB 23ai, these are the roles carrying each privilege the job needs:
+
+| Privilege | Roles that grant it |
+|---|---|
+| `CREATE USER`, `ALTER USER`, `DROP USER` | `DBA`, `PDB_DBA`, `DV_ACCTMGR`, `OML_SYS_ADMIN`, `IMP_FULL_DATABASE`, `DATAPUMP_CLOUD_IMP` |
+| `GRANT ANY OBJECT PRIVILEGE` | `DBA`, `PDB_DBA`, `IMP_FULL_DATABASE`, `DATAPUMP_IMP_FULL_DATABASE`, `DATAPUMP_CLOUD_IMP` |
+| `EXECUTE ON DBMS_NETWORK_ACL_ADMIN` | `DBA`, `PDB_DBA`, `EXECUTE_CATALOG_ROLE` |
+
+Only `DBA` and `PDB_DBA` cover all three. The datapump import roles come close but also carry
+`GRANT ANY PRIVILEGE`, which `PDB_DBA` does not - they are a **wider** grant, not a narrower one.
+`DV_ACCTMGR` and `OML_SYS_ADMIN` manage users but reach neither the object privileges nor the ACL.
+
+**The smaller option is no role at all.** These twelve explicit grants pass every check, with the
+user holding zero roles:
+
+```sql
+CREATE USER <user> IDENTIFIED BY "<password>";
+
+GRANT CREATE SESSION                          TO <user>;
+GRANT CREATE USER                             TO <user>;   -- one schema per source namespace
+GRANT ALTER USER                              TO <user>;   -- rotates the schema password each run
+GRANT DROP USER                               TO <user>;   -- teardown cell only
+GRANT CREATE TABLE     TO <user> WITH ADMIN OPTION;        -- own registry, and pass to schemas
+GRANT CREATE SESSION   TO <user> WITH ADMIN OPTION;
+GRANT CREATE VIEW      TO <user> WITH ADMIN OPTION;
+GRANT UNLIMITED TABLESPACE TO <user> WITH ADMIN OPTION;    -- quota for the schemas it creates
+ALTER USER <user> QUOTA UNLIMITED ON DATA;                 -- for its own registry table
+GRANT EXECUTE ON DBMS_CLOUD             TO <user> WITH GRANT OPTION;
+GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <user> WITH GRANT OPTION;
+GRANT EXECUTE ON DBMS_NETWORK_ACL_ADMIN TO <user>;
+```
+
+Every `WITH ADMIN OPTION` / `WITH GRANT OPTION` above exists because the job **passes that
+privilege on** to each schema it provisions - not because the job needs it more broadly.
+
+The difference is not marginal:
+
+| | Nested roles | System privileges | Object privileges |
+|---|---|---|---|
+| `DBA` | 16 | 288 | 6,370 |
+| `PDB_DBA` | 30 | 275 | 43,662 |
+| **Explicit set above** | **0** | **9** | **3** |
+
+`PDB_DBA` is convenient, not minimal. Use it to get running; use the explicit set when the grant
+has to survive a security review.
+
 ### The full privilege list
 
 For a user without `PDB_DBA`, or to review least privilege:
@@ -433,11 +481,17 @@ For a user without `PDB_DBA`, or to review least privilege:
 | `ALTER USER <schema> IDENTIFIED BY ...` | `ALTER USER` | yes |
 | `GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW TO <schema>` | those privileges **with admin option**, or `GRANT ANY PRIVILEGE` | yes |
 | `GRANT EXECUTE ON DBMS_CLOUD TO <schema>` | `EXECUTE ON DBMS_CLOUD` **with grant option**, or `GRANT ANY OBJECT PRIVILEGE` | **no - grant it** |
+
 | `GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <schema>` | grant option on the `SYS`-owned directory | yes |
 | `ALTER USER <schema> QUOTA UNLIMITED ON DATA` | `ALTER USER` plus authority over the tablespace | yes |
 | `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE` | `EXECUTE` on the `SYS`-owned package | yes |
 | `SELECT ... FROM ALL_USERS` | none beyond `CREATE SESSION` | yes |
 | registry `CREATE TABLE` / `SELECT` / `MERGE` / `DELETE` | see below | see below |
+
+`DBMS_CLOUD` is a public synonym for a **version-suffixed** package
+(`C##CLOUD$SERVICE.DBMS_CLOUD$PDBCS_<version>`). Always grant through the synonym, as above, so it
+re-resolves; a grant pinned to the versioned object may not survive an ADB patch. If
+`CREATE_EXTERNAL_TABLE` starts failing with `ORA-01031` after a patch window, re-issue the grant.
 
 The `DATA_PUMP_DIR` grant is required for **reading** an external table, not only for creating
 it. Losing it produces `ORA-06564` long after provisioning looked successful. The same applies to
