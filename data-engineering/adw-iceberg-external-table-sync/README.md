@@ -399,137 +399,81 @@ place a TLS/mTLS mismatch surfaces before the apply step.
 
 ---
 
-## Running as a non-ADMIN user
+## Using a dedicated user instead of ADMIN
 
-`adw_user` accepts any user with enough privilege. The list below is what the **administrative**
-connection actually needs - each row maps to a statement the job issues - measured against
-Autonomous Database 23ai (23.26.3.2.0), not inferred from the documentation.
+**The default is `ADMIN`, and it is the recommended setting.** A dedicated user is worth creating,
+but be clear about what it buys: **not less privilege.**
 
-### If the user has `PDB_DBA`
+### Why a dedicated user is still worth it
 
-`PDB_DBA` covers almost everything. Two grants are still missing, and both must be issued by
-`ADMIN`:
+`adw_user: AIDP_SYNC_ADMIN` (any name) buys separation, not containment:
+
+- the job's credential can be rotated or revoked without touching `ADMIN`, which the whole fleet
+  and every human operator also use;
+- database audit distinguishes what the sync did from what a person did;
+- if the credential leaks, you drop one user instead of rotating `ADMIN` across the fleet.
+
+### Why it is not a privilege reduction
+
+The job **creates one ADW user per source schema and rotates its password on every run**, so it
+needs `CREATE USER` and `ALTER USER`. `ALTER USER` has no scope: whoever holds it can set
+`ADMIN`'s password and connect as `ADMIN` on the next statement. Verified on ADB 23ai - a user
+with no roles at all, holding only the individual grants this job needs, still changes another
+user's password successfully.
+
+So any user that can drive this sync is admin-equivalent. Treat the credential accordingly:
+Vault, no reuse, rotate on staff changes. Do not present it to a security review as a restricted
+account.
+
+The only change that would genuinely reduce authority is architectural - pre-provision the
+schemas out of band so the job never needs `CREATE USER` / `ALTER USER`. That is the same
+direction as the proxy-authentication item in `ARCHITECTURE.md`, and it is not implemented.
+
+### Setting one up
+
+`PDB_DBA` covers almost everything. Two grants are missing and both must be issued by `ADMIN`:
 
 ```sql
-GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION;
-ALTER USER <user> QUOTA UNLIMITED ON DATA;
+CREATE USER AIDP_SYNC_ADMIN IDENTIFIED BY "<password>";
+GRANT CREATE SESSION TO AIDP_SYNC_ADMIN;
+GRANT PDB_DBA        TO AIDP_SYNC_ADMIN;
+
+GRANT EXECUTE ON DBMS_CLOUD TO AIDP_SYNC_ADMIN WITH GRANT OPTION;
+ALTER USER AIDP_SYNC_ADMIN QUOTA UNLIMITED ON DATA;
 ```
 
 | Missing grant | How it fails |
 |---|---|
-| `EXECUTE ON DBMS_CLOUD` **with grant option** | `ORA-01031` when the job runs `GRANT EXECUTE ON DBMS_CLOUD TO <schema>`. `PDB_DBA` can *use* `DBMS_CLOUD` but cannot pass it on, and the job grants it to every schema it provisions |
-| `QUOTA UNLIMITED ON DATA` | `ORA-01950` on the first registry `MERGE`. Note `CREATE TABLE` succeeds without it - deferred segment creation means the quota only bites on the first insert, so a create-only smoke test will not catch this |
+| `EXECUTE ON DBMS_CLOUD` **with grant option** | `ORA-01031` when the job runs `GRANT EXECUTE ON DBMS_CLOUD TO <schema>`. `PDB_DBA` can *use* `DBMS_CLOUD` but not pass it on, and the job passes it to every schema it provisions |
+| `QUOTA UNLIMITED ON DATA` | `ORA-01950` on the first registry `MERGE`. `CREATE TABLE` succeeds without it - deferred segment creation means the quota only bites on the first insert, so a create-only smoke test misses this |
 
-With those two, a user holding only `CREATE SESSION` and `PDB_DBA` drives the sync end to end.
+No role avoids these two. `DBMS_CLOUD` is a public synonym for a package owned by the **common**
+user `C##CLOUD$SERVICE`, and `GRANT ANY OBJECT PRIVILEGE` does not reach a common object from
+inside the PDB - so even a user granted plain `DBA` fails the same check. `ADMIN` works only
+because Oracle grants it directly, per versioned package, with `GRANTABLE = YES`. Quota is a
+per-user attribute, so no role can carry it either.
 
-### Is there a role that covers everything?
+Two operational notes:
 
-**No - not even `DBA`.** Measured on ADB 23ai by granting each role to a bare user and running
-every check:
+- **After an ADB patch**, the versioned package name changes
+  (`C##CLOUD$SERVICE.DBMS_CLOUD$PDBCS_<version>`). Grant through the synonym, as above, so it
+  re-resolves; if `CREATE_EXTERNAL_TABLE` starts returning `ORA-01031` after a patch window,
+  re-issue the grant.
+- The ADB mandatory password profile **rejects a password containing the user name**
+  (`ORA-28219` / `ORA-20002`). This affects only the user you create by hand; the per-schema
+  passwords the job generates are random.
 
-| Granted | Result |
-|---|---|
-| `DBA` only | 10 / 11 - fails `GRANT EXECUTE ON DBMS_CLOUD` with `ORA-01031` |
-| `PDB_DBA` only | 9 / 11 - same failure, plus `ORA-01950` (no tablespace quota) |
-
-`GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION` **cannot come from any role**, and the
-reason is structural:
-
-- `DBMS_CLOUD` is a public synonym for a package owned by the **common** user
-  `C##CLOUD$SERVICE`, living at CDB level;
-- `GRANT ANY OBJECT PRIVILEGE` - which both `DBA` and `PDB_DBA` carry - does not reach a common
-  object from inside the PDB;
-- no role in the database holds that `EXECUTE` as grantable. `DWROLE`, `GRAPH_DEVELOPER` and
-  `OSAK_ADMIN_ROLE` hold it with `GRANTABLE = NO`, so they can *use* `DBMS_CLOUD` but not pass it
-  on - and passing it on is exactly what the job does for every schema it provisions;
-- `ADMIN` works only because Oracle grants it **directly**, per versioned package, with
-  `GRANTABLE = YES`, at provisioning time.
-
-Likewise **no role can supply the tablespace quota**: no role in the database holds
-`UNLIMITED TABLESPACE`, because quota is a per-user attribute, not a privilege.
-
-So there is no "grant one role and go" option. The realistic choices:
-
-| Approach | Extra grants needed | Scope handed over |
-|---|---|---|
-| `DBA` | `EXECUTE ON DBMS_CLOUD ... WITH GRANT OPTION` | the whole database |
-| `PDB_DBA` | the same, plus `QUOTA UNLIMITED ON DATA` | 30 nested roles, 275 system and 43,662 object privileges |
-| Explicit grants, no role | all twelve below | 9 system and 3 object privileges |
-
-`PDB_DBA` plus two grants is the pragmatic middle: strictly less than `DBA`, and one line longer.
-
-### Least privilege: no role at all
-
-Twelve explicit grants pass every check with the user holding zero roles:
-
-```sql
-CREATE USER <user> IDENTIFIED BY "<password>";
-
-GRANT CREATE SESSION                          TO <user>;
-GRANT CREATE USER                             TO <user>;   -- one schema per source namespace
-GRANT ALTER USER                              TO <user>;   -- rotates the schema password each run
-GRANT DROP USER                               TO <user>;   -- teardown cell only
-GRANT CREATE TABLE     TO <user> WITH ADMIN OPTION;        -- own registry, and pass to schemas
-GRANT CREATE SESSION   TO <user> WITH ADMIN OPTION;
-GRANT CREATE VIEW      TO <user> WITH ADMIN OPTION;
-GRANT UNLIMITED TABLESPACE TO <user> WITH ADMIN OPTION;    -- quota for the schemas it creates
-ALTER USER <user> QUOTA UNLIMITED ON DATA;                 -- for its own registry table
-GRANT EXECUTE ON DBMS_CLOUD             TO <user> WITH GRANT OPTION;
-GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <user> WITH GRANT OPTION;
-GRANT EXECUTE ON DBMS_NETWORK_ACL_ADMIN TO <user>;
-```
-
-Every `WITH ADMIN OPTION` / `WITH GRANT OPTION` above exists because the job **passes that
-privilege on** to each schema it provisions - not because the job needs it more broadly.
-
-### The full privilege list
-
-For a user without `PDB_DBA`, or to review least privilege:
-
-| Statement the job issues | Privilege required | Carried by `PDB_DBA` |
-|---|---|---|
-| `ALTER SESSION DISABLE PARALLEL DML` | `ALTER SESSION` | yes |
-| `CREATE USER <schema>` | `CREATE USER` | yes |
-| `ALTER USER <schema> IDENTIFIED BY ...` | `ALTER USER` | yes |
-| `GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW TO <schema>` | those privileges **with admin option**, or `GRANT ANY PRIVILEGE` | yes |
-| `GRANT EXECUTE ON DBMS_CLOUD TO <schema>` | `EXECUTE ON DBMS_CLOUD` **with grant option**, or `GRANT ANY OBJECT PRIVILEGE` | **no - grant it** |
-
-| `GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <schema>` | grant option on the `SYS`-owned directory | yes |
-| `ALTER USER <schema> QUOTA UNLIMITED ON DATA` | `ALTER USER` plus authority over the tablespace | yes |
-| `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE` | `EXECUTE` on the `SYS`-owned package | yes |
-| `SELECT ... FROM ALL_USERS` | none beyond `CREATE SESSION` | yes |
-| registry `CREATE TABLE` / `SELECT` / `MERGE` / `DELETE` | see below | see below |
-
-`DBMS_CLOUD` is a public synonym for a **version-suffixed** package
-(`C##CLOUD$SERVICE.DBMS_CLOUD$PDBCS_<version>`). Always grant through the synonym, as above, so it
-re-resolves; a grant pinned to the versioned object may not survive an ADB patch. If
-`CREATE_EXTERNAL_TABLE` starts failing with `ORA-01031` after a patch window, re-issue the grant.
-
-The `DATA_PUMP_DIR` grant is required for **reading** an external table, not only for creating
-it. Losing it produces `ORA-06564` long after provisioning looked successful. The same applies to
-the network ACL: without it, reads fail with `ORA-24247` while the tables themselves exist.
-
-### Where the registry lives
-
-`registry_table` is created and written by the administrative connection, so its schema qualifier
-decides which privileges that user needs.
+### Point the registry at the user's own schema
 
 ```yaml
-registry_table: EXT_REGISTRY_V4     # unqualified - recommended for a non-ADMIN user
+adw_user: AIDP_SYNC_ADMIN
+registry_table: EXT_REGISTRY_V4     # unqualified
 ```
 
-Unqualified, it resolves to each ADW's own `adw_user` schema. The job then needs no `ANY TABLE`
-privilege at all, and a fleet using different users per ADW keeps its state separated.
-
-The default `ADMIN.EXT_REGISTRY_V4` points into another schema, which needs `CREATE ANY TABLE`
-plus `SELECT/INSERT/UPDATE/DELETE ANY TABLE`. A `PDB_DBA` user does carry those, so it works -
-it just relies on privileges the job does not otherwise need.
-
-### Creating the user
-
-The ADB mandatory password profile rejects a password containing the user name
-(`ORA-28219` / `ORA-20002`). This applies when you create the administrative user by hand; the
-per-schema passwords the job generates are random and unaffected.
+Unqualified, `registry_table` resolves to each ADW's own `adw_user` schema, so a fleet using
+different users per ADW keeps its state separated. The default `ADMIN.EXT_REGISTRY_V4` also works
+for a `PDB_DBA` user - it carries the `ANY TABLE` privileges - but there is no reason to depend
+on them.
 
 ---
 
