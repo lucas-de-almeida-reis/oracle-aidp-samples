@@ -53,8 +53,10 @@ adw_prefixes:
 # would redact "ADMIN" throughout the notebook output, including SELECT user FROM dual
 # and every error message.
 #
-# Using a NON-ADMIN user? PDB_DBA alone is NOT enough - it needs two extra grants.
-# Run preflight_adw_user.sql as that user first; the README explains both.
+# Using a NON-ADMIN user? PDB_DBA alone is NOT enough. As ADMIN, also grant:
+#   GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION;
+#   ALTER USER <user> QUOTA UNLIMITED ON DATA;
+# Full privilege list in the README, section "Running as a non-ADMIN user".
 adw_user: ADMIN
 
 # --- Naming ---

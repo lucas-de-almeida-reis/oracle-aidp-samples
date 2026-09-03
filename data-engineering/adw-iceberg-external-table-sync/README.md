@@ -401,42 +401,69 @@ place a TLS/mTLS mismatch surfaces before the apply step.
 
 ## Running as a non-ADMIN user
 
-Verified on Autonomous Database 23ai (23.26.3.2.0) against a user granted **only**
-`CREATE SESSION` and `PDB_DBA`. Nine of the eleven checks in
-[`preflight_adw_user.sql`](preflight_adw_user.sql) passed as-is; two needed a grant.
+`adw_user` accepts any user with enough privilege. The list below is what the **administrative**
+connection actually needs - each row maps to a statement the job issues - measured against
+Autonomous Database 23ai (23.26.3.2.0), not inferred from the documentation.
 
-**`PDB_DBA` alone is not enough. Add these two, as `ADMIN`:**
+### If the user has `PDB_DBA`
+
+`PDB_DBA` covers almost everything. Two grants are still missing, and both must be issued by
+`ADMIN`:
 
 ```sql
 GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION;
 ALTER USER <user> QUOTA UNLIMITED ON DATA;
 ```
 
-| Failure without them | Why |
+| Missing grant | How it fails |
 |---|---|
-| `GRANT EXECUTE ON DBMS_CLOUD` -> `ORA-01031` | `PDB_DBA` can *use* `DBMS_CLOUD` but cannot pass it on, and the job grants it to every schema it provisions. `WITH GRANT OPTION` is the point |
-| `MERGE` into the registry -> `ORA-01950` | no quota on `DATA`. `CREATE TABLE` succeeds regardless - deferred segment creation means the quota only bites on the first insert, so a create-only smoke test misses this |
+| `EXECUTE ON DBMS_CLOUD` **with grant option** | `ORA-01031` when the job runs `GRANT EXECUTE ON DBMS_CLOUD TO <schema>`. `PDB_DBA` can *use* `DBMS_CLOUD` but cannot pass it on, and the job grants it to every schema it provisions |
+| `QUOTA UNLIMITED ON DATA` | `ORA-01950` on the first registry `MERGE`. Note `CREATE TABLE` succeeds without it - deferred segment creation means the quota only bites on the first insert, so a create-only smoke test will not catch this |
 
-With those two, the same user passes all eleven checks.
+With those two, a user holding only `CREATE SESSION` and `PDB_DBA` drives the sync end to end.
 
-**What `PDB_DBA` does already cover**, all verified rather than assumed: `CREATE USER`,
-`ALTER USER ... IDENTIFIED BY`, granting `CREATE SESSION / TABLE / VIEW`,
-`GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR`, `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE`,
-`ALTER SESSION DISABLE PARALLEL DML`, and reading `ALL_USERS`.
+### The full privilege list
 
-It also carries `CREATE/SELECT/INSERT/UPDATE/DELETE ANY TABLE`, so the default
-`registry_table: ADMIN.EXT_REGISTRY_V4` **does** work for a `PDB_DBA` user writing into the
-`ADMIN` schema. Leaving the name **unqualified** is still the better choice:
+For a user without `PDB_DBA`, or to review least privilege:
+
+| Statement the job issues | Privilege required | Carried by `PDB_DBA` |
+|---|---|---|
+| `ALTER SESSION DISABLE PARALLEL DML` | `ALTER SESSION` | yes |
+| `CREATE USER <schema>` | `CREATE USER` | yes |
+| `ALTER USER <schema> IDENTIFIED BY ...` | `ALTER USER` | yes |
+| `GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW TO <schema>` | those privileges **with admin option**, or `GRANT ANY PRIVILEGE` | yes |
+| `GRANT EXECUTE ON DBMS_CLOUD TO <schema>` | `EXECUTE ON DBMS_CLOUD` **with grant option**, or `GRANT ANY OBJECT PRIVILEGE` | **no - grant it** |
+| `GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <schema>` | grant option on the `SYS`-owned directory | yes |
+| `ALTER USER <schema> QUOTA UNLIMITED ON DATA` | `ALTER USER` plus authority over the tablespace | yes |
+| `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE` | `EXECUTE` on the `SYS`-owned package | yes |
+| `SELECT ... FROM ALL_USERS` | none beyond `CREATE SESSION` | yes |
+| registry `CREATE TABLE` / `SELECT` / `MERGE` / `DELETE` | see below | see below |
+
+The `DATA_PUMP_DIR` grant is required for **reading** an external table, not only for creating
+it. Losing it produces `ORA-06564` long after provisioning looked successful. The same applies to
+the network ACL: without it, reads fail with `ORA-24247` while the tables themselves exist.
+
+### Where the registry lives
+
+`registry_table` is created and written by the administrative connection, so its schema qualifier
+decides which privileges that user needs.
 
 ```yaml
-registry_table: EXT_REGISTRY_V4
+registry_table: EXT_REGISTRY_V4     # unqualified - recommended for a non-ADMIN user
 ```
 
-It resolves to each ADW's own `adw_user` schema, so the job stops depending on `ANY TABLE`
-privileges at all, and a fleet using different users per ADW keeps its state separated.
+Unqualified, it resolves to each ADW's own `adw_user` schema. The job then needs no `ANY TABLE`
+privilege at all, and a fleet using different users per ADW keeps its state separated.
 
-Run the preflight as the candidate user on one ADW before adopting it - it prints PASS/FAIL per
-line, and each failure names the statement the job would have issued.
+The default `ADMIN.EXT_REGISTRY_V4` points into another schema, which needs `CREATE ANY TABLE`
+plus `SELECT/INSERT/UPDATE/DELETE ANY TABLE`. A `PDB_DBA` user does carry those, so it works -
+it just relies on privileges the job does not otherwise need.
+
+### Creating the user
+
+The ADB mandatory password profile rejects a password containing the user name
+(`ORA-28219` / `ORA-20002`). This applies when you create the administrative user by hand; the
+per-schema passwords the job generates are random and unaffected.
 
 ---
 
@@ -573,7 +600,6 @@ carries the key is rejected rather than silently ignored. Reasoning in `ARCHITEC
 | `adw_sync.sample.yaml` | the commented template. Copy it to `adw_sync.yaml` - see Step 6 |
 | `ARCHITECTURE.md` | design, diagrams, measured scale, test evidence, references |
 | `Architecture-EXT-TABLE-Sync.drawio.png` | component diagram, editable in draw.io |
-| `preflight_adw_user.sql` | run as a candidate `adw_user` before adopting it; PASS/FAIL per required privilege |
 | `requirements.txt` | `oracledb`, `oci`, `pyyaml` - install as cluster libraries |
 | `README.md` | this file |
 
