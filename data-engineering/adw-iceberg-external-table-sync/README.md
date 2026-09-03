@@ -401,37 +401,42 @@ place a TLS/mTLS mismatch surfaces before the apply step.
 
 ## Running as a non-ADMIN user
 
-`adw_user` accepts any user with enough privilege, but two things need attention.
+Verified on Autonomous Database 23ai (23.26.3.2.0) against a user granted **only**
+`CREATE SESSION` and `PDB_DBA`. Nine of the eleven checks in
+[`preflight_adw_user.sql`](preflight_adw_user.sql) passed as-is; two needed a grant.
 
-**Point the registry at that user's own schema.** `registry_table` defaults to
-`ADMIN.EXT_REGISTRY_V4`, and the registry is created and written by the **administrative**
-connection. A non-ADMIN user writing into the `ADMIN` schema needs `CREATE ANY TABLE` plus
-`SELECT/INSERT/UPDATE/DELETE ANY TABLE`. Leaving the name **unqualified** avoids all of that:
+**`PDB_DBA` alone is not enough. Add these two, as `ADMIN`:**
+
+```sql
+GRANT EXECUTE ON DBMS_CLOUD TO <user> WITH GRANT OPTION;
+ALTER USER <user> QUOTA UNLIMITED ON DATA;
+```
+
+| Failure without them | Why |
+|---|---|
+| `GRANT EXECUTE ON DBMS_CLOUD` -> `ORA-01031` | `PDB_DBA` can *use* `DBMS_CLOUD` but cannot pass it on, and the job grants it to every schema it provisions. `WITH GRANT OPTION` is the point |
+| `MERGE` into the registry -> `ORA-01950` | no quota on `DATA`. `CREATE TABLE` succeeds regardless - deferred segment creation means the quota only bites on the first insert, so a create-only smoke test misses this |
+
+With those two, the same user passes all eleven checks.
+
+**What `PDB_DBA` does already cover**, all verified rather than assumed: `CREATE USER`,
+`ALTER USER ... IDENTIFIED BY`, granting `CREATE SESSION / TABLE / VIEW`,
+`GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR`, `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE`,
+`ALTER SESSION DISABLE PARALLEL DML`, and reading `ALL_USERS`.
+
+It also carries `CREATE/SELECT/INSERT/UPDATE/DELETE ANY TABLE`, so the default
+`registry_table: ADMIN.EXT_REGISTRY_V4` **does** work for a `PDB_DBA` user writing into the
+`ADMIN` schema. Leaving the name **unqualified** is still the better choice:
 
 ```yaml
 registry_table: EXT_REGISTRY_V4
 ```
 
-It then resolves to each ADW's own `adw_user` schema, which also works when the fleet uses
-different users per ADW.
+It resolves to each ADW's own `adw_user` schema, so the job stops depending on `ANY TABLE`
+privileges at all, and a fleet using different users per ADW keeps its state separated.
 
-**Check the privileges the administrative connection actually needs.** Beyond ordinary DDL it
-grants privileges it does not own and calls a `SYS` package:
-
-| Operation | Needs |
-|---|---|
-| `CREATE USER` / `ALTER USER ... IDENTIFIED BY` | `CREATE USER`, `ALTER USER` |
-| `GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW` | those privileges **with admin option**, or `GRANT ANY PRIVILEGE` |
-| `GRANT EXECUTE ON DBMS_CLOUD` | grant option on `DBMS_CLOUD`, or `GRANT ANY OBJECT PRIVILEGE` |
-| `GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR` | grant option on the `SYS`-owned directory, or `GRANT ANY OBJECT PRIVILEGE` |
-| `ALTER USER ... QUOTA UNLIMITED ON DATA` | `ALTER USER` plus authority over the tablespace |
-| `DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE` | `EXECUTE` on the `SYS`-owned package |
-| registry DDL and DML | ownership of `registry_table`, or the `ANY TABLE` privileges above |
-
-The last three are the ones that commonly are **not** carried by a role on Autonomous, where
-`PDB_DBA` is deliberately narrower than an on-premises `DBA`. Rather than reason about it, run
-the preflight in [`preflight_adw_user.sql`](preflight_adw_user.sql) as the candidate user on one
-ADW: it exercises each capability and prints PASS/FAIL per line.
+Run the preflight as the candidate user on one ADW before adopting it - it prints PASS/FAIL per
+line, and each failure names the statement the job would have issued.
 
 ---
 

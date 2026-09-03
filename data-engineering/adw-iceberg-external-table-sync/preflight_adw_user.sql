@@ -60,7 +60,7 @@ BEGIN
    DECLARE
       v_roles VARCHAR2(4000);
    BEGIN
-      SELECT LISTAGG(granted_role, ', ') WITHIN GROUP (ORDER BY granted_role)
+      SELECT LISTAGG(role, ', ') WITHIN GROUP (ORDER BY role)
         INTO v_roles
         FROM session_roles;
       DBMS_OUTPUT.PUT_LINE('Roles        : ' || NVL(v_roles, '(none)'));
@@ -68,6 +68,13 @@ BEGIN
       WHEN OTHERS THEN DBMS_OUTPUT.PUT_LINE('Roles        : (unreadable) ' || SQLERRM);
    END;
    DBMS_OUTPUT.PUT_LINE(RPAD('-', 66, '-'));
+
+   ----------------------------------------------------------------------------------------
+   -- 0. Session prep, exactly as the notebook's _prep() does it. Must come FIRST: the state
+   --    cannot be changed once a transaction is open (ORA-12841), and without it the registry
+   --    MERGE runs as parallel DML and the next statement hits ORA-12838.
+   ----------------------------------------------------------------------------------------
+   try('ALTER SESSION DISABLE PARALLEL DML', 'ALTER SESSION DISABLE PARALLEL DML');
 
    ----------------------------------------------------------------------------------------
    -- 1. User lifecycle: the job creates one ADW user per source schema and rotates its
@@ -135,12 +142,6 @@ BEGIN
        || 'WHEN MATCHED THEN UPDATE SET r.schema_fp=s.schema_fp '
        || 'WHEN NOT MATCHED THEN INSERT(catalog_name,owner,table_name,schema_fp,synced_at) '
        || 'VALUES(s.catalog_name,s.owner,s.table_name,s.schema_fp,SYSTIMESTAMP)');
-
-   ----------------------------------------------------------------------------------------
-   -- 7. ALTER SESSION DISABLE PARALLEL DML - the notebook's session prep. Its absence is
-   --    what produces ORA-12838 on the registry MERGE.
-   ----------------------------------------------------------------------------------------
-   try('ALTER SESSION DISABLE PARALLEL DML', 'ALTER SESSION DISABLE PARALLEL DML');
 
    ----------------------------------------------------------------------------------------
    -- 8. Visibility of other users - the job checks ALL_USERS before creating a schema.

@@ -53,8 +53,8 @@ adw_prefixes:
 # would redact "ADMIN" throughout the notebook output, including SELECT user FROM dual
 # and every error message.
 #
-# Using a NON-ADMIN user? See registry_table below - the default points into the ADMIN
-# schema and is the first thing that breaks.
+# Using a NON-ADMIN user? PDB_DBA alone is NOT enough - it needs two extra grants.
+# Run preflight_adw_user.sql as that user first; the README explains both.
 adw_user: ADMIN
 
 # --- Naming ---
@@ -106,11 +106,13 @@ discovery:
 # --- Infrastructure ---
 # Sync state, one row per (catalog, owner, table). Created and written by the ADMINISTRATIVE
 # connection, so the schema qualifier decides which privileges that user needs:
-#   ADMIN.EXT_REGISTRY_V4   only correct when adw_user really is ADMIN. Any other user needs
-#                           CREATE ANY TABLE plus SELECT/INSERT/UPDATE/DELETE ANY TABLE.
-#   EXT_REGISTRY_V4         unqualified - resolves to each ADW's own adw_user schema. This is
-#                           the right choice for a non-ADMIN user, and works per ADW even when
-#                           the fleet uses different users.
+#   ADMIN.EXT_REGISTRY_V4   needs CREATE ANY TABLE plus SELECT/INSERT/UPDATE/DELETE ANY
+#                           TABLE when adw_user is not ADMIN. A PDB_DBA user does carry
+#                           these (verified on ADB 23ai), so this works - it just relies on
+#                           privileges the job does not otherwise need.
+#   EXT_REGISTRY_V4         unqualified - resolves to each ADW's own adw_user schema. Prefer
+#                           this for any non-ADMIN user: no ANY TABLE privileges required,
+#                           and a fleet with different users per ADW keeps state separated.
 registry_table: ADMIN.EXT_REGISTRY_V4
 acl_privileges:
   - connect
