@@ -319,19 +319,22 @@ Two situations where it **stops instead of choosing**, both deliberately:
 
 ## Adding a new ADW
 
-Four secrets, four credentials, one line of YAML. No code change.
+Two secrets, two credentials, one line of YAML. No code change. (Four and four if
+`flags.use_wallet` is true — see [Walletless TLS](#walletless-tls).)
 
 **1. Choose a prefix.** Say `demo_adw3`. It becomes the ADW name in every log line, so pick
 something you will recognise.
 
-**2. Upload the wallet** into the bucket, in a folder matching the prefix:
+**2. Upload the wallet** into the bucket, in a folder matching the prefix. **Skip this step with
+`flags.use_wallet: false`:**
 
 ```bash
 oci os object put --bucket-name aidp-adw-wallets \
   --name demo_adw3/Wallet_adw3.zip --file ./Wallet_adw3.zip
 ```
 
-**3. Create four secrets** in the Vault, following the same pattern as the existing ones:
+**3. Create the secrets** in the Vault, following the same pattern as the existing ones. The two
+`wallet_*` rows apply only when `flags.use_wallet` is true:
 
 | Secret | Contents |
 |---|---|
@@ -340,8 +343,8 @@ oci os object put --bucket-name aidp-adw-wallets \
 | `demo_adw3_pwd` | password of the administrative user |
 | `demo_adw3_wallet_pwd` | password of the wallet |
 
-**4. Register the four in the Credential Store** as **Vault Reference**, each named exactly like
-its secret, all pointing at the same vault OCID.
+**4. Register them in the Credential Store** as **Vault Reference**, each named exactly like its
+secret, all pointing at the same vault OCID.
 
 **5. Add one line to `adw_sync.yaml`:**
 

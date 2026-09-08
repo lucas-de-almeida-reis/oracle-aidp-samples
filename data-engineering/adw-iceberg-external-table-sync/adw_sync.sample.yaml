@@ -43,8 +43,8 @@ adw_prefixes:
 #   adw_user: ADMIN          a single value, used on every ADW
 #
 #   adw_user:                per ADW, keyed by the prefix. Prefixes not listed fall
-#     pb_adw1: SYNC_ADMIN    back to ADMIN; an unknown key is rejected, because a typo
-#     pb_adw2: ADMIN         would otherwise silently connect as the wrong user.
+#     demo_adw1: SYNC_ADMIN  back to ADMIN; an unknown key is rejected, because a typo
+#     demo_adw2: ADMIN       would otherwise silently connect as the wrong user.
 #
 # A positional list is refused: it rebinds users to the wrong ADWs as soon as
 # adw_prefixes is reordered, and nothing in the run would show it.
