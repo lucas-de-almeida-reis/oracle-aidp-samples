@@ -2,7 +2,19 @@
 #  Iceberg external table sync: AIDP -> Oracle Autonomous Database
 #  Deployment configuration: adw_sync.yaml
 #
-#  Holds NO secret - only prefixes, region and tuning knobs. Every secret
+#  WORKED EXAMPLE. adw_sync.sample.yaml is the commented template that documents
+#  every key; this file is one concrete combination of them, ready to edit:
+#
+#    - the service account comes from ONE JSON credential (oci_credential_secret)
+#      rather than four single-value ones, with the tenancy OCID alongside it;
+#    - each ADW is driven by its OWN database user, not ADMIN (adw_user as a map);
+#    - registry_table is unqualified, so each ADW keeps its state in that user's
+#      own schema and the job needs no ANY TABLE privilege;
+#    - mTLS is off (flags.use_wallet: false), so each ADW needs 2 secrets, not 4.
+#
+#  Replace every CHANGE_ME_ value, and the demo_ prefixes with your own.
+#
+#  Holds NO secret - only names, region and tuning knobs. Every secret
 #  lives in OCI Vault and is read through the AIDP Credential Store.
 #  Safe to version and share.
 #
@@ -21,33 +33,25 @@
 region: us-ashburn-1
 
 # --- OCI service account ---
-# Two ways to supply it. Set EXACTLY ONE - both set is rejected, so a half-finished
-# migration cannot quietly keep reading the old secrets.
+# ONE credential holding a JSON document with the whole identity:
+#   {"user_id": "...", "api_key": {"fingerprint": "...", "private_pem": "..."}}
+# Extra fields (user_name, created_at, public_pem, customer_secret_key) are ignored.
 #
-# (a) ONE credential holding a JSON document. Use this when the account is provisioned
-#     by a system that publishes the whole identity as a single value. Expected shape,
-#     extra fields ignored:
+# The value below is the credential name USED VERBATIM. Nothing is prefixed,
+# suffixed or otherwise derived from it, so whatever name your provisioning
+# emits goes here unchanged - no naming convention is imposed.
 #
-#       {"user_id": "ocid1.user.oc1..xxxx",
-#        "api_key": {"fingerprint": "aa:bb:...",
-#                    "private_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"}}
-#
-#     The document carries no tenancy field, so oci_tenancy_id below is required with
-#     this option. Both PKCS#1 and PKCS#8 private keys are accepted as-is.
-#
-#     The name is used VERBATIM - nothing is prefixed, suffixed or derived from
-#     it - so whatever name your provisioning emits goes here unchanged.
-#
-# oci_credential_secret: <exact credential name, as registered>
-#
-# (b) FOUR credentials sharing a prefix:
-#       <prefix>_user_id  <prefix>_tenancy_id  <prefix>_fingerprint  <prefix>_privkey
-oci_credential_prefix: demo_oci
+# >>> Put the exact name as registered in the AIDP Credential Store. <<<
+oci_credential_secret: CHANGE_ME_exact_credential_name
 
-# Tenancy OCID. Required with (a), ignored with (b) - option (b) reads it from
-# <prefix>_tenancy_id. It lives here and not in the Vault because it is an identifier,
-# not a secret: it appears in every OCI Console URL.
-# oci_tenancy_id: ocid1.tenancy.oc1..xxxx
+# Required with oci_credential_secret: the JSON document has no tenancy field.
+# An identifier, not a secret - it appears in every OCI Console URL.
+#
+# >>> Set this to your tenancy OCID. <<<
+oci_tenancy_id: CHANGE_ME_ocid1.tenancy.oc1..xxxx
+
+# The four-single-value alternative. Leave commented: setting both is rejected.
+# oci_credential_prefix: demo_oci
 
 # --- ADW fleet ---
 # One prefix per ADW. Each expects:
@@ -67,8 +71,8 @@ adw_prefixes:
 #   adw_user: ADMIN          a single value, used on every ADW
 #
 #   adw_user:                per ADW, keyed by the prefix. Prefixes not listed fall
-#     demo_adw1: SYNC_ADMIN  back to ADMIN; an unknown key is rejected, because a typo
-#     demo_adw2: ADMIN       would otherwise silently connect as the wrong user.
+#     demo_adw1: SYNC_ADMIN    back to ADMIN; an unknown key is rejected, because a typo
+#     demo_adw2: ADMIN         would otherwise silently connect as the wrong user.
 #
 # A positional list is refused: it rebinds users to the wrong ADWs as soon as
 # adw_prefixes is reordered, and nothing in the run would show it.
@@ -79,7 +83,13 @@ adw_prefixes:
 # cleaner audit, NOT less privilege: this job needs CREATE USER and ALTER USER, and
 # ALTER USER reaches every account including ADMIN. If you do create one, PDB_DBA plus
 # two grants is the recipe - see the README, "Using a dedicated user instead of ADMIN".
-adw_user: ADMIN
+# One entry per ADW, keyed by the prefix above. Keys must match adw_prefixes exactly -
+# an unknown key is rejected rather than falling back silently.
+#
+# >>> Set these to the users you created on each ADW. <<<
+adw_user:
+  demo_adw1: CHANGE_ME_SYNC_ADMIN_1
+  demo_adw2: CHANGE_ME_SYNC_ADMIN_2
 
 # --- Naming ---
 naming:
@@ -106,7 +116,7 @@ flags:
   # required; each <prefix>_dsn must then be the TLS connection string from the console,
   # not the mTLS descriptor. With false, the two wallet secrets are not read at all -
   # 4 credentials per ADW become 2 - and the wallet bucket becomes unnecessary.
-  use_wallet: true
+  use_wallet: false
 
 # --- Parallelism ---
 # Connections per run = min(fleet size, adw_workers_cap) x workers
@@ -137,7 +147,9 @@ discovery:
 #   EXT_REGISTRY_V4         unqualified - resolves to each ADW's own adw_user schema. Prefer
 #                           this for any non-ADMIN user: no ANY TABLE privileges required,
 #                           and a fleet with different users per ADW keeps state separated.
-registry_table: ADMIN.EXT_REGISTRY_V4
+# Unqualified: resolves to each ADW's own adw_user schema, so the fleet keeps its state
+# separated and the job needs no ANY TABLE privilege.
+registry_table: EXT_REGISTRY_V4
 acl_privileges:
   - connect
 vault_key: VaultSecretReference
@@ -148,4 +160,4 @@ progress:
 
 # CATALOG fallback for INTERACTIVE TESTING, when no job parameter exists.
 # Leave null in production: the banner warns loudly if this value is used.
-catalog: null
+catalog: scale_test

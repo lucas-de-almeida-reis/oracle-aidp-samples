@@ -202,7 +202,12 @@ path and the password go to the Vault.
 
 Some environments provision the service account through automation that publishes the whole
 identity as one document. Set `oci_credential_secret` to that credential's name and the notebook
-reads it instead of the four `<prefix>_*` secrets:
+reads it instead of the four `<prefix>_*` secrets.
+
+**The name is used verbatim.** Unlike `oci_credential_prefix` and `adw_prefixes`, which have
+suffixes appended to build the real names, this value *is* the credential name — nothing is
+prefixed, suffixed or derived from it. Whatever your provisioning emits, register it under that
+exact name and put it here; no naming convention is imposed.
 
 ```yaml
 oci_credential_secret: <credential name>
