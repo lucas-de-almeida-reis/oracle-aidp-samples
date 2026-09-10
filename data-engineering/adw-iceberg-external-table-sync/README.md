@@ -165,14 +165,15 @@ this documentation:
 | `demo_oci_fingerprint` | API key fingerprint | Identity -> Users -> the user -> API Keys |
 | `demo_oci_privkey` | the private key contents | the `.pem` file you downloaded when creating the API key |
 
-For `demo_oci_privkey`, two accepted shapes:
+For `demo_oci_privkey`, store the key in whatever shape you have - full PEM with headers,
+PKCS#1 or PKCS#8, or the bare base64 body on one line. The notebook normalises it.
 
-- the **base64 body only**, on a single line, headers stripped - assumed to be PKCS#1;
-- the **full PEM including headers** - used verbatim, which covers PKCS#8
-  (`-----BEGIN PRIVATE KEY-----`), the format of many OCI Console generated keys.
-
-If your key is PKCS#8, store it **with the headers**. Without them it would be wrapped in the
-wrong header and the client fails with an invalid-key error that is hard to trace back.
+That matters because the two consumers want different shapes. The Object Storage client takes a
+PEM; `DBMS_CLOUD.CREATE_CREDENTIAL` wants the **bare base64 body of a PKCS#1 key**, and a PKCS#8
+body is accepted at creation and then signs incorrectly - the failure surfaces much later as
+`ORA-20401` on a read, or as `ORA-20000: Failed to generate column list` out of
+`CREATE_EXTERNAL_TABLE`. The notebook converts for each consumer rather than asking whoever
+fills the Vault to get it right.
 
 **Per-ADW secrets** - four for each ADW, sharing a prefix. One prefix per ADW; it also becomes
 that ADW's name in every log line, so pick something recognisable:
@@ -227,7 +228,10 @@ Expected shape. Extra fields are ignored, so a document carrying `user_name`, `c
 }
 ```
 
-Both PKCS#1 and PKCS#8 keys are accepted as they come.
+`private_pem` is used whatever its shape. Provisioners typically emit PKCS#8
+(`-----BEGIN PRIVATE KEY-----`); the notebook re-emits it as the PKCS#1 body
+`DBMS_CLOUD.CREATE_CREDENTIAL` requires, and passes the PEM to the Object Storage client
+separately. Nothing to convert on your side.
 
 **`oci_tenancy_id` is required with this option**, because the document has no tenancy field and
 the value is needed both by the Object Storage client and by `DBMS_CLOUD.CREATE_CREDENTIAL`. It
