@@ -21,9 +21,30 @@
 region: us-ashburn-1
 
 # --- OCI service account ---
-# Prefix of the credentials in the Credential Store. Expects four:
-#   <prefix>_user_id  <prefix>_tenancy_id  <prefix>_fingerprint  <prefix>_privkey
+# Two ways to supply it. Set EXACTLY ONE - both set is rejected, so a half-finished
+# migration cannot quietly keep reading the old secrets.
+#
+# (a) ONE credential holding a JSON document. Use this when the account is provisioned
+#     by a system that publishes the whole identity as a single value. Expected shape,
+#     extra fields ignored:
+#
+#       {"user_id": "ocid1.user.oc1..xxxx",
+#        "api_key": {"fingerprint": "aa:bb:...",
+#                    "private_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"}}
+#
+#     The document carries no tenancy field, so oci_tenancy_id below is required with
+#     this option. Both PKCS#1 and PKCS#8 private keys are accepted as-is.
+#
+# oci_credential_secret: <name of the single credential>
+#
+# (b) FOUR credentials sharing a prefix:
+#       <prefix>_user_id  <prefix>_tenancy_id  <prefix>_fingerprint  <prefix>_privkey
 oci_credential_prefix: demo_oci
+
+# Tenancy OCID. Required with (a), ignored with (b) - option (b) reads it from
+# <prefix>_tenancy_id. It lives here and not in the Vault because it is an identifier,
+# not a secret: it appears in every OCI Console URL.
+# oci_tenancy_id: ocid1.tenancy.oc1..xxxx
 
 # --- ADW fleet ---
 # One prefix per ADW. Each expects:

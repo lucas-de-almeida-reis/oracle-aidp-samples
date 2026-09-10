@@ -198,6 +198,46 @@ thumb: **a short, common value, or one that appears in logs, does not belong in 
 The wallet **files** do not belong there either - they exceed the 25 KB secret limit. Only the
 path and the password go to the Vault.
 
+### A single JSON credential instead of four
+
+Some environments provision the service account through automation that publishes the whole
+identity as one document. Set `oci_credential_secret` to that credential's name and the notebook
+reads it instead of the four `<prefix>_*` secrets:
+
+```yaml
+oci_credential_secret: <credential name>
+oci_tenancy_id: ocid1.tenancy.oc1..xxxx
+```
+
+Expected shape. Extra fields are ignored, so a document carrying `user_name`, `created_at`,
+`public_pem` or anything else needs no trimming:
+
+```json
+{
+  "user_id": "ocid1.user.oc1..xxxx",
+  "api_key": {
+    "fingerprint": "aa:bb:cc:...",
+    "private_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }
+}
+```
+
+Both PKCS#1 and PKCS#8 keys are accepted as they come.
+
+**`oci_tenancy_id` is required with this option**, because the document has no tenancy field and
+the value is needed both by the Object Storage client and by `DBMS_CLOUD.CREATE_CREDENTIAL`. It
+belongs in the YAML rather than the Vault: a tenancy OCID is an identifier, not a secret - it
+appears in every OCI Console URL. If your provisioner does include a `tenancy_id` or
+`tenancy_ocid` field in the document, that is used and the YAML key becomes optional.
+
+Set **exactly one** of `oci_credential_secret` and `oci_credential_prefix`. Both set is rejected
+rather than resolved by precedence, so a half-finished migration cannot quietly keep reading the
+old secrets. With the single credential, a two-ADW fleet needs **5 credentials** instead of 8.
+
+Nothing read from the Vault is printed. The banner reports credential *names* and counts only,
+and every message the notebook prints or raises is filtered so a value that came from the Vault
+is replaced with `[REDACTED]` even when it arrives inside a driver or SDK error.
+
 ### Step 4 - Register the secrets in the AIDP Credential Store
 
 For **each** secret created in Step 3, in AIDP Workbench: **Credential Store -> Create ->
