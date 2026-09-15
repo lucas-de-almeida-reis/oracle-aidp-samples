@@ -107,7 +107,7 @@ flowchart LR
 
     subgraph ADWS["Oracle Autonomous - N read-only consumers"]
         A1["ADW 1<br/>external tables"]
-        REG["sync registry<br/>ADMIN.EXT_REGISTRY_V4<br/>keyed by catalog"]
+        REG["sync registry<br/>+ credential state<br/>keyed by catalog"]
         A2["ADW 2"]
         AN["ADW N"]
     end
@@ -272,6 +272,36 @@ candidate. That was an actual bug: a second catalog computed `drop=4748`.
 `NOPARALLEL` plus `ALTER SESSION DISABLE PARALLEL DML` avoids `ORA-12838`, since ADW enables
 parallel DML by default and the registry MERGE is followed by reads of the same object.
 
+### Credential state
+
+A second, much smaller table records which **API key** each schema's `DBMS_CLOUD` credential was
+built from:
+
+```sql
+CREATE TABLE EXT_CRED_STATE_V1 (
+  catalog_name    VARCHAR2(128),
+  owner           VARCHAR2(128),
+  cred_name       VARCHAR2(128),
+  key_fingerprint VARCHAR2(128),
+  updated_at      TIMESTAMP,
+  CONSTRAINT ext_cred_state_v1_pk PRIMARY KEY (catalog_name, owner)
+) NOPARALLEL
+```
+
+It exists because the registry answers the wrong question for one failure mode. The ADWs read
+Object Storage with a credential **built from** the service account key, one per schema. Rotate
+that key and nothing about the *tables* changes, so every row still fingerprint-matches and the
+run reports SKIP across the board - while every consumer query fails with `ORA-20401`, or
+`ORA-20000: Failed to generate column list`. Healthy-looking sync, dead fleet.
+
+Comparing the recorded fingerprint against the one read from the credential closes that: a
+mismatch reinstalls the credential in the affected schemas, with no table touched, so consumers
+read straight through it. A fingerprint identifies a key and is not the key, so the table holds
+nothing secret.
+
+The check runs **before** the early return for "nothing to sync", which is the whole point - the
+rotation case is precisely the one where there is no table work to trigger it.
+
 ### Decision table
 
 | Registry state | Action | Statements executed |
@@ -281,8 +311,16 @@ parallel DML by default and the registry MERGE is followed by reads of the same 
 | fingerprint matches | **SKIP** | none |
 | in registry, absent from source | DROP | drop table and view |
 
-**SKIP is the common case in steady state and costs zero DDL** (only the per-run registry read and session setup). That is what makes the
-run time proportional to *change*, not to fleet size.
+And independently of the table state, per schema:
+
+| Credential state | Action | Statements executed |
+|---|---|---|
+| recorded fingerprint matches | none | none |
+| differs, or nothing recorded | reinstall credential | `ALTER USER` (password), `DROP`/`CREATE_CREDENTIAL`, record the fingerprint |
+
+**SKIP is the common case in steady state and costs zero DDL** (only the per-run registry and
+credential-state reads, plus session setup). That is what makes the run time proportional to
+*change*, not to fleet size.
 
 ### Idempotency
 
@@ -343,6 +381,12 @@ GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO <schema>;
 ALTER USER <schema> QUOTA UNLIMITED ON DATA;
 ```
 
+> Two tables belong to the job rather than to the data: `registry_table` holds the per-table
+> fingerprints that drive the incremental decision, and `credential_state_table` holds the API key
+> fingerprint behind each schema's credential. Both are created on demand, both are keyed by
+> catalog, and leaving their names unqualified puts them in the `adw_user` schema - which is what
+> you want when `adw_user` is not `ADMIN`, because it drops the need for any `ANY TABLE` privilege.
+
 ### OCI side
 
 | Item | What for |
@@ -360,12 +404,28 @@ One IAM user, one API key, used by two consumers:
 2. every ADW, through `DBMS_CLOUD.CREATE_CREDENTIAL`, to read Parquet and Iceberg metadata at
    query time.
 
-Reusing one identity is deliberate: one thing to grant, rotate and audit. Its four fields live
-in the Vault as four separate secrets.
+Reusing one identity is deliberate: one thing to grant, rotate and audit. Its four fields live in
+**one Credential Store entry of type Service account**, inside AIDP - not in OCI Vault.
+
+That placement is what removes an IAM grant rather than narrowing one. A Vault Reference needs the
+AIDP service principal to hold `read secret-bundles` in the secret's compartment; a native
+Service account credential needs no IAM policy at all, because the values are not in Vault. What
+guards it instead is AIDP's own RBAC, which is per credential and per identity.
+
+Which is what makes **Run As** meaningful for this job. A scheduled run executes under an explicit
+identity - your own, or a service account - and Oracle's documentation is precise about the
+constraint: *"Run As only resolves a credential that already exists for that identity in
+Credential Store."* With the service account held natively, a job can run as a non-person identity
+whose authority is a permission on that one credential entry, rather than a compartment-wide IAM
+grant that any AIDP instance in the compartment would also satisfy. Two grants are still needed -
+the configurator must be allowed to select the service account, and the service account needs
+explicit permission on the credential. Not exercised here; the point is that the credential
+placement no longer stands in the way.
 
 ### Policies
 
-Reading secrets - the principal is the **AIDP service**:
+Reading secrets - the principal is the **AIDP service**. Needed for the per-ADW `_dsn` and `_pwd`,
+which are Vault References. **Not** needed for the service account, which is a native credential:
 
 ```
 allow any-user to use secrets         in compartment id <CMP> where all { request.principal.type = 'aidataplatform' }
@@ -384,12 +444,15 @@ Three IAM traps, all encountered in practice:
    ones are plural: `secrets`, `secret-bundles`, `secret-versions`, `secret-family`. The
    statement the AIDP console itself suggests is wrong here.
 2. `in tenancy` is only valid in a policy created in the **root** compartment.
-3. The AIDP console also suggests a condition on
-   `target.resource.tag.orcl-aidp.governingAidpId`. **AIDP does not apply that system tag to
-   referenced secrets** - verified after registering a Vault Reference. The predicate can never
-   match, so the read fails. Consequence worth raising with a security team: today the grant can
-   only be scoped by compartment, so every AIDP instance in that compartment can read the
-   secrets.
+3. Scoping the grant to a single AIDP instance. The Credential Store documentation prescribes
+   `request.principal.id = target.secret.system-tag.orcl-aidp.governingAidpId`, which is a
+   **secret system-tag** predicate. An earlier attempt here used the generic defined-tag form
+   `target.resource.tag.orcl-aidp.governingAidpId` and failed - which says nothing about the
+   documented form, since they are different predicates. Worth trying the documented one: if the
+   tag is absent the policy fails closed, so the blast radius of testing it is losing access, not
+   widening it. Without that condition the grant is scoped only by compartment, so every AIDP
+   instance in that compartment can read those secrets - which is the argument for keeping them
+   in a compartment of their own.
 
 ---
 
@@ -557,6 +620,8 @@ minutes. Treat it as a deliberate, per-run choice.
 | Wallets in a bucket, not a Volume | provisioning becomes a CLI or Terraform call; several AIDP instances share one fleet |
 | Discovery shields unreadable tables from DROP | a transient read failure must never delete a healthy external table |
 | Registry written after the work, only for successes | an interrupted run converges instead of lying |
+| Credential keyed by the API key fingerprint | rotating the key changes no table, so the registry alone reports SKIP while every consumer query fails; the fingerprint is what makes the rotation visible |
+| Fingerprint stored, never the key | it identifies a key well enough to compare, and the state table stays free of secrets |
 | Grants captured before the drop | `DROP` loses object grants; a recreate would silently revoke every consumer |
 
 ---
@@ -577,6 +642,7 @@ What was actually exercised, and what was not.
 | `RENAME COLUMN` and `DROP COLUMN` drift | `aligned` matched the observed consumer behaviour three times out of three |
 | Async UniForm conversion | measured at 5 to 9s; recreating earlier yields the old columns |
 | Vault secret rotation | new version picked up in the same session, no restart |
+| API key rotation detection | exercised against a recording fake of the ADW, not a live run: a fingerprint mismatch reinstalls the credential in every affected schema with no table work, a match is a no-op at zero DDL, an absent state table treats every schema as stale, dry run reports and writes nothing, and the run after a rotation converges to `creds=0` |
 | Config discovery in a scheduled workflow | resolved with three decoy `config.yaml` files present |
 | Wallet from an Object Storage bucket | passed |
 | **Not tested:** parallel reader on the `_high` service | - |
