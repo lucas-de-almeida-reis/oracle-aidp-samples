@@ -10,12 +10,15 @@
 #    - each ADW is driven by its OWN database user, not ADMIN (adw_user as a map);
 #    - registry_table is unqualified, so each ADW keeps its state in that user's
 #      own schema and the job needs no ANY TABLE privilege;
-#    - mTLS is off (flags.use_wallet: false), so each ADW needs 2 secrets, not 4.
+#    - mTLS is off (flags.use_wallet: false), so each ADW needs 2 secrets, not 4,
+#      and every ADB must be on a private endpoint with mutual TLS not required.
 #
 #  Replace every CHANGE_ME_ value, and the demo_ prefixes with your own.
 #
 #  Holds NO secret - only names, region and tuning knobs. Every secret
-#  lives in OCI Vault and is read through the AIDP Credential Store.
+#  is read through the AIDP Credential Store: the service account from a
+#  native Service account credential, the per-ADW values as Vault References
+#  to OCI Vault.
 #  Safe to version and share.
 #
 #  The only per-run input is CATALOG, passed as a job parameter.
@@ -103,7 +106,10 @@ flags:
   # mTLS wallet, fleet-wide. Set false ONLY when every ADB has mutual TLS set to NOT
   # required; each <prefix>_dsn must then be the TLS connection string from the console,
   # not the mTLS descriptor. With false, the two wallet secrets are not read at all -
-  # 4 credentials per ADW become 2 - and the wallet bucket becomes unnecessary.
+  # 4 credentials per ADW become 2 - and the wallet bucket and its policy become
+  # unnecessary. The Vault, its References and the secrets policy stay in both modes.
+  # From AIDP, false needs a PRIVATE-endpoint ADB: on a public endpoint, turning mutual
+  # TLS off requires an ACL, and an active ACL refuses AIDP (ORA-12529).
   use_wallet: false
 
 # --- Parallelism ---
