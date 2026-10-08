@@ -408,26 +408,34 @@ YAML exactly.
 
 ### Step 7 - Create `adw_sync.yaml`
 
-This folder ships **two** files, and they play different roles:
+This folder ships one configuration file, and it is **not** the one the notebook reads:
 
 | File | Role |
 |---|---|
-| `adw_sync.sample.yaml` | the template. Every key documented, with the trade-offs. Keep it untouched as a reference |
-| `adw_sync.yaml` | a worked example - one concrete combination, ready to edit. This is the file the notebook reads |
+| `adw_sync.example.yaml` | the commented template. Every key documented, with the trade-offs |
+| `adw_sync.yaml` | your deployment copy - the file the notebook reads. Not shipped; listed in this folder's `.gitignore` |
 
-Start from `adw_sync.yaml`, replace its `CHANGE_ME_` values and the `demo_` prefixes, and consult
-the template whenever a key needs explaining.
+Copy the template and edit the copy:
+
+```
+cp adw_sync.example.yaml adw_sync.yaml
+```
+
+Replace the `CHANGE_ME_` values and the `demo_` prefixes; the comments beside each key explain the
+alternatives.
 
 **The name matters** - `adw_sync.yaml` is the distinctive name the notebook resolves on its own
-under `/Workspace`.
+under `/Workspace`, which is exactly why the repository does not ship a file with that name: a
+committed copy would collide with a real deployment's configuration (the notebook stops when it
+finds more than one), or, found alone, would run with its `CHANGE_ME_` values.
 
 Then set `oci_credential_service_account` to the credential name from Step 3, point
 `adw_prefixes` at the prefixes you chose, and set `region`. Set **`flags.use_wallet`** to the mode
-you chose: the worked example ships with `false` (walletless), the template keeps the default
-`true` (mTLS).
+you chose: the template keeps the default `true` (mTLS); set `false` for walletless TLS.
 Nothing else is required; the banner in cell 1 lists which absent keys fell back to defaults.
 
-The YAML holds **no secret** - only prefixes, region and knobs. Version it freely.
+The YAML holds **no secret** - only prefixes, region and knobs. Version it freely in your own
+deployment repository.
 
 Objects created in ADW are named `<catalog>_<schema>.<table_prefix><table>`. With
 `CATALOG=sales`, the AIDP table `analytics.orders` becomes `SALES_ANALYTICS.ORDERS`.
@@ -774,10 +782,16 @@ So the rotation propagates on the next scheduled run with no flag to remember an
 The summary carries a `creds` count of how many schemas were reinstalled:
 
 ```
-demo_adw1: {'create': 0, 'recreate': 0, 'skip': 4762, 'drop': 0, 'ok': 0, 'err': 0, 'creds': 10}
+demo_adw1: {'create': 0, 'recreate': 0, 'skip': 4762, 'drop': 0, 'ok': 0, 'err': 0, 'creds': 10, 'cred_err': 0}
 ```
 
 No table is touched on that path, so consumers keep reading straight through it.
+
+A reinstall that **fails** - a wrong fingerprint, a key the database cannot parse, a missing
+privilege - is counted in `cred_err`, and the apply cell raises when any schema has `cred_err > 0`.
+The job therefore goes red instead of reporting success over a schema whose consumers can no longer
+read: `DROP_CREDENTIAL` has already run by the time `CREATE_CREDENTIAL` fails, so that schema has no
+credential until the next successful run.
 
 The detection compares the **fingerprint field** of the credential, as typed into the form. Update
 the fingerprint together with the private key: a new key under the old fingerprint is not seen as
@@ -829,13 +843,15 @@ all.
 ### Reading the summary
 
 ```
-demo_adw1: {'create': 12, 'recreate': 3, 'skip': 4762, 'drop': 0, 'ok': 15, 'creds': 2, 'err': 0, 'grants': 8}
+demo_adw1: {'create': 12, 'recreate': 3, 'skip': 4762, 'drop': 0, 'ok': 15, 'creds': 2, 'cred_err': 0, 'err': 0, 'grants': 8}
 ```
 
 `skip` dominating is the healthy steady state. `creds` is the number of schemas whose `DBMS_CLOUD`
 credential was installed this run - those with table work, plus any whose recorded key fingerprint
-no longer matches. `err > 0` prints the first twenty errors with the real Oracle cause, which is
-often on the second line of the message.
+no longer matches. `cred_err` is the number of schemas where that install **failed**; any value
+above zero fails the job, since the schema is left without a `DBMS_CLOUD` credential. `err > 0`
+prints the first twenty errors with the real Oracle cause, which is often on the second line of
+the message.
 
 ### Teardown
 
@@ -876,7 +892,7 @@ protections are in `ARCHITECTURE.md`, section 7.
 
 ## Configuration reference
 
-Full commented template in `adw_sync.sample.yaml`.
+Full commented template in `adw_sync.example.yaml`.
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -899,7 +915,7 @@ Full commented template in `adw_sync.sample.yaml`.
 | `parallelism.read_workers` | `32` | parallel `metadata.json` reads |
 | `discovery.list_page` | `1000` | objects per listing request; also the API maximum |
 | `discovery.fallback_max_per_schema` | `20` | cap on individual `DESCRIBE` calls per schema |
-| `discovery.exclude_schemas` | see sample | schemas never synced |
+| `discovery.exclude_schemas` | see the example file | schemas never synced |
 | `registry_table` | `ADMIN.EXT_REGISTRY_V4` | sync state, catalog-scoped. Leave **unqualified** when `adw_user` is not `ADMIN` |
 | `credential_state_table` | `EXT_CRED_STATE_V1` | API key fingerprint per `(catalog, schema)`, used to detect a rotation. Same schema-qualifier rule as `registry_table` |
 | `acl_privileges` | `[connect]` | network ACL privileges |
@@ -916,16 +932,18 @@ carries the key is rejected rather than silently ignored. Reasoning in `ARCHITEC
 | Path | What it is |
 |---|---|
 | `adw_external_table_sync.ipynb` | the notebook |
-| `adw_sync.yaml` | worked example - the file the notebook reads. Replace the `CHANGE_ME_` values |
-| `adw_sync.sample.yaml` | the commented template, documenting every key |
+| `adw_sync.example.yaml` | the commented template, documenting every key. Copy it to `adw_sync.yaml` and replace the `CHANGE_ME_` values |
+| `.gitignore` | keeps `adw_sync.yaml`, the deployment copy, out of version control |
 | `ARCHITECTURE.md` | design, diagrams, measured scale, test evidence, references |
 | `Architecture-EXT-TABLE-Sync.drawio.png` | component diagram, editable in draw.io |
-| `requirements.txt` | `oracledb`, `oci`, `pyyaml` - install as cluster libraries |
+| `requirements.txt` | `oracledb`, `oci`, `pyyaml`, `cryptography` - install as cluster libraries |
 | `README.md` | this file |
 
 ## Dependencies
 
-`oracledb`, `oci` and `pyyaml`, listed in `requirements.txt`.
+`oracledb`, `oci`, `pyyaml` and `cryptography`, listed in `requirements.txt`. `cryptography` converts the
+service account key to the PKCS#1 form `DBMS_CLOUD.CREATE_CREDENTIAL` needs; it is a dependency of `oci`, so
+it is normally present wherever `oci` is.
 
 **Install them as cluster libraries**, on the compute cluster attached to the notebook and to the
 job. In AIDP Workbench: **Compute -> your cluster -> Libraries -> Install new -> PyPI**, one entry

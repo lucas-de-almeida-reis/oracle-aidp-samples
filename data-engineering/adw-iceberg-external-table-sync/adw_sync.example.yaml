@@ -1,34 +1,33 @@
 # =====================================================================
 #  Iceberg external table sync: AIDP -> Oracle Autonomous Database
-#  Deployment configuration: adw_sync.yaml
+#  Example configuration: copy this file to adw_sync.yaml and edit the copy
 #
-#  WORKED EXAMPLE. adw_sync.sample.yaml is the commented template that documents
-#  every key; this file is one concrete combination of them, ready to edit:
+#    cp adw_sync.example.yaml adw_sync.yaml
 #
-#    - the service account comes from ONE credential of type "Service account", which
-#      carries the User OCID, Tenancy OCID, Fingerprint and private key natively;
-#    - each ADW is driven by its OWN database user, not ADMIN (adw_user as a map);
-#    - registry_table is unqualified, so each ADW keeps its state in that user's
-#      own schema and the job needs no ANY TABLE privilege;
-#    - mTLS is off (flags.use_wallet: false), so each ADW needs 2 secrets, not 4,
-#      and every ADB must be on a private endpoint with mutual TLS not required.
+#  Every key is documented here, with its trade-offs. Replace each CHANGE_ME_
+#  value and the demo_ prefixes with your own; the remaining keys are sensible
+#  defaults (ADMIN as the administrative user, mTLS with a wallet, a qualified
+#  registry table). The alternative shapes - one database user per ADW,
+#  walletless TLS, an unqualified registry - are described inline at the key
+#  they belong to.
 #
-#  Replace every CHANGE_ME_ value, and the demo_ prefixes with your own.
-#
-#  Holds NO secret - only names, region and tuning knobs. Every secret
-#  is read through the AIDP Credential Store: the service account from a
-#  native Service account credential, the per-ADW values as Vault References
-#  to OCI Vault.
-#  Safe to version and share.
+#  The deployment copy, adw_sync.yaml, holds NO secret - only prefixes, region
+#  and tuning knobs. Every secret is read through the AIDP Credential Store:
+#  the service account from a native Service account credential, the per-ADW
+#  values as Vault References to OCI Vault. Safe to version and share, but
+#  this repository lists it in .gitignore so a real deployment's values are
+#  never committed to the samples.
 #
 #  The only per-run input is CATALOG, passed as a job parameter.
 #
-#  The file name matters. The notebook locates this file without assuming
-#  any path, and 'adw_sync.yaml' is a distinctive name: found on its own
-#  under /Workspace it already resolves, even if the notebook is renamed
-#  or the folder moved. A generic 'config.yaml' is only accepted when it
-#  sits next to the notebook, because a real workspace usually holds
-#  several files with that name, belonging to other projects.
+#  The file name matters. The notebook locates adw_sync.yaml without assuming
+#  any path: 'adw_sync.yaml' is a distinctive name, found on its own under
+#  /Workspace it already resolves, even if the notebook is renamed or the
+#  folder moved. That is also why this file is NOT called adw_sync.yaml - an
+#  example that the notebook could pick up, or that would make a real
+#  deployment ambiguous, is worse than none. A generic 'config.yaml' is only
+#  accepted when it sits next to the notebook, because a real workspace
+#  usually holds several files with that name, belonging to other projects.
 # =====================================================================
 
 # Region of the OBJECT STORAGE / lakehouse - NOT the ADWs.
@@ -62,8 +61,8 @@ adw_prefixes:
 #   adw_user: ADMIN          a single value, used on every ADW
 #
 #   adw_user:                per ADW, keyed by the prefix. Prefixes not listed fall
-#     demo_adw1: SYNC_ADMIN    back to ADMIN; an unknown key is rejected, because a typo
-#     demo_adw2: ADMIN         would otherwise silently connect as the wrong user.
+#     demo_adw1: SYNC_ADMIN  back to ADMIN; an unknown key is rejected, because a typo
+#     demo_adw2: ADMIN       would otherwise silently connect as the wrong user.
 #
 # A positional list is refused: it rebinds users to the wrong ADWs as soon as
 # adw_prefixes is reordered, and nothing in the run would show it.
@@ -74,13 +73,7 @@ adw_prefixes:
 # cleaner audit, NOT less privilege: this job needs CREATE USER and ALTER USER, and
 # ALTER USER reaches every account including ADMIN. If you do create one, PDB_DBA plus
 # two grants is the recipe - see the README, "Using a dedicated user instead of ADMIN".
-# One entry per ADW, keyed by the prefix above. Keys must match adw_prefixes exactly -
-# an unknown key is rejected rather than falling back silently.
-#
-# >>> Set these to the users you created on each ADW. <<<
-adw_user:
-  demo_adw1: CHANGE_ME_SYNC_ADMIN_1
-  demo_adw2: CHANGE_ME_SYNC_ADMIN_2
+adw_user: ADMIN
 
 # --- Naming ---
 naming:
@@ -110,7 +103,7 @@ flags:
   # unnecessary. The Vault, its References and the secrets policy stay in both modes.
   # From AIDP, false needs a PRIVATE-endpoint ADB: on a public endpoint, turning mutual
   # TLS off requires an ACL, and an active ACL refuses AIDP (ORA-12529).
-  use_wallet: false
+  use_wallet: true
 
 # --- Parallelism ---
 # Connections per run = min(fleet size, adw_workers_cap) x workers
@@ -132,16 +125,29 @@ discovery:
     - default
 
 # --- Infrastructure ---
-# Two tables the job owns. Both are created on demand, keyed by catalog, and written by the
-# ADMINISTRATIVE connection - so the schema qualifier decides which privileges adw_user needs.
-# Unqualified, as below, they resolve to each ADW's own adw_user schema: no ANY TABLE privilege
-# required, and a fleet with different users per ADW keeps its state separated.
+# Two tables the job owns, both created on demand and keyed by catalog:
 #
-#   registry_table          sync state, one row per (catalog, owner, table)
+#   registry_table          sync state, one row per (catalog, owner, table). This is what
+#                           drives the incremental CREATE / RECREATE / SKIP / DROP decision.
 #   credential_state_table  the API key fingerprint behind each schema's DBMS_CLOUD credential,
-#                           so a rotated key is detected and the credential reinstalled.
-#                           A fingerprint identifies a key; it is not the key.
-registry_table: EXT_REGISTRY_V4
+#                           so a rotated key is detected and the credential reinstalled even
+#                           when no table changed. A fingerprint identifies a key; it is not
+#                           the key, so nothing secret is stored here.
+#
+# Both are written by the ADMINISTRATIVE connection, so the schema qualifier decides which
+# privileges adw_user needs - and the rule is the same for both:
+#
+#   ADMIN.<name>   needs CREATE ANY TABLE plus SELECT/INSERT/UPDATE/DELETE ANY TABLE when
+#                  adw_user is not ADMIN. A PDB_DBA user does carry these (verified on ADB
+#                  23ai), so it works - it just relies on privileges the job does not
+#                  otherwise need.
+#   <name>         unqualified - resolves to each ADW's own adw_user schema. Prefer this for
+#                  any non-ADMIN user: no ANY TABLE privileges required, and a fleet with
+#                  different users per ADW keeps its state separated.
+#
+# registry_table keeps its historical qualified default; credential_state_table is new and
+# defaults unqualified. Set both the same way for your deployment.
+registry_table: ADMIN.EXT_REGISTRY_V4
 credential_state_table: EXT_CRED_STATE_V1
 
 acl_privileges:
@@ -154,4 +160,4 @@ progress:
 
 # CATALOG fallback for INTERACTIVE TESTING, when no job parameter exists.
 # Leave null in production: the banner warns loudly if this value is used.
-catalog: scale_test
+catalog: null

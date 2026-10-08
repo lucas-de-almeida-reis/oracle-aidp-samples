@@ -360,6 +360,7 @@ which is correct, and re-running converges.
 | `oracledb` | Python driver, thin mode |
 | `oci` Python SDK | Object Storage listing and reads |
 | `pyyaml` | configuration |
+| `cryptography` | re-emits the service account key as PKCS#1 for `DBMS_CLOUD.CREATE_CREDENTIAL`; a dependency of `oci` |
 
 `REORG TABLE ... APPLY (UPGRADE UNIFORM(ICEBERG_COMPAT_VERSION=2))` regenerates Iceberg
 metadata when needed. Databricks' `MSCK REPAIR TABLE ... SYNC METADATA` does **not** exist in
