@@ -379,6 +379,7 @@ open-source Spark and is not used.
 | `DATA_PUMP_DIR` | `GRANT READ, WRITE` required for **both creating and reading** an Iceberg external table |
 | `ALTER SESSION DISABLE PARALLEL DML` | avoids `ORA-12838` around the registry MERGE |
 | `user_tab_privs` | grant capture and replay across a recreate |
+| `log_table` (default `EXT_SYNC_LOG_V1`) | execution log: one row per relevant event of each apply run, per ADW |
 | `all_users`, `all_objects` | existence checks and teardown reporting |
 | mTLS wallet, or TLS without wallet | connectivity, chosen fleet-wide - see [Connection modes](#connection-modes-mtls-and-walletless-tls) |
 

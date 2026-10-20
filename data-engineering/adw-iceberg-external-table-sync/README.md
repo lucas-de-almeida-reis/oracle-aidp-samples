@@ -869,7 +869,102 @@ protections are in `ARCHITECTURE.md`, section 7.
 
 ---
 
+## Execution log
+
+Every **apply** run writes one row per relevant event into `log_table` (default
+`EXT_SYNC_LOG_V1`), inside each target ADW. The design rules:
+
+- **One log per ADW, each self-contained.** Catalog-level events (discovery findings, the plan,
+  rename repairs, forced snapshots) are replicated into every ADW's log, so the rows in one ADW
+  tell the whole story of the run without reaching into another database. An ADW that was
+  unreachable simply has no rows for that run — the absence itself is the signal.
+- **Actions and findings only.** A table that is healthy, in sync and skipped produces no row;
+  its numbers live in the `PLAN_BUILT` and `RUN_END` summaries. Steady state is ~15–25 rows per
+  run per ADW, independent of catalog size.
+- **Operational events, not stack traces.** Error rows carry the database error text an operator
+  needs (`ORA-…`/`KUP-…`), scrubbed of secrets.
+- **Concurrency-safe.** Many runs (several catalogs × ADWs) insert into the same table; the
+  identity column orders rows globally and `run_id` + `catalog_name` separate the runs. The
+  `run_id` is printed in the run banner and after each ADW's apply.
+- **The log can never break the sync**: a failed log write prints a warning and the run
+  continues. The **dry run writes nothing**, and events start at the first successful admin
+  connection — a run that fails earlier (config, Vault, discovery crash) appears only in the
+  run output, never in the table.
+
+### Columns
+
+| Column | Meaning | Empty when |
+|---|---|---|
+| `log_id`, `log_time` | identity (global order) and `SYSTIMESTAMP` | never |
+| `run_id` | one id per execution, shared across the fleet | never |
+| `catalog_name`, `adw_name` | which catalog's job wrote the row, into which ADW | never |
+| `phase` / `event` | see the catalog below | never |
+| `owner`, `object_name` | the ADW schema and object acted on | summary and discovery rows |
+| `source_table` | the AIDP `schema.table` behind the object | drops (source is gone), summaries |
+| `status` | `OK`, `WARNING` or `ERROR` | never |
+| `detail` | counts, durations, backup paths, scrubbed error text | when nothing to add |
+
+### Events
+
+| Phase | Event | When |
+|---|---|---|
+| `RUN` | `RUN_START` | per ADW: config path, connection mode, db user, flags, parallelism — names only, never credential values |
+| `RUN` | `RUN_END` | every exit, success or abort; `detail` carries the same summary dict the run prints, plus duration |
+| `DISCOVERY` | `SCHEMA_SCANNED` | per schema: tables found, with metadata, objects listed, requests |
+| `DISCOVERY` | `TABLE_ERROR` | a table discovery could not read — excluded and shielded from DROP |
+| `DISCOVERY` | `RENAMED_DETECTED` | Iceberg metadata references a previous folder (see the troubleshooting row on renames) |
+| `DISCOVERY` | `MISALIGNED` | tip snapshot older than the current schema |
+| `DISCOVERY` | `PROTECTED_FROM_DROP` | summary of the shield, when it protected anything |
+| `PLAN` | `PLAN_BUILT` | totals, duration, and the storage layout discovery derived |
+| `FIX_RENAMED` | `METADATA_MOVED` / `REPAIRED` / `FIX_TIMEOUT` / `FIX_FAILED` / `FIX_SKIPPED_FLAG_OFF` | the rename repair, step by step, including the backup path |
+| `FORCE_SNAPSHOT` | `SNAPSHOT_ROLLED` / `SNAPSHOT_FAILED` | per realigned table |
+| `GUARD` | `GUARD_TRIPPED` | the DROP guard refused the run |
+| `APPLY` | `CROSS_CATALOG_COLLISION` | the collision check refused the run |
+| `CREDENTIAL` | `CRED_REFRESHED` / `CRED_ERROR` | per schema whose DBMS_CLOUD credential was (re)installed |
+| `APPLY` | `TABLE_CREATED` / `TABLE_RECREATED` / `TABLE_DROPPED` | per action, with grants reapplied and whether a retry was needed |
+| `APPLY` | `TABLE_ERROR` | per failed action, with the database error text |
+
+### Useful queries
+
+```sql
+-- the full story of one run on this ADW (run_id is printed by the run)
+SELECT log_time, phase, event, status, owner, object_name, source_table, detail
+FROM   EXT_SYNC_LOG_V1 WHERE run_id = :run_id ORDER BY log_id;
+
+-- everything that went wrong in the last 24 hours, newest first
+SELECT log_time, run_id, catalog_name, event, owner, object_name, detail
+FROM   EXT_SYNC_LOG_V1
+WHERE  status = 'ERROR' AND log_time > SYSTIMESTAMP - INTERVAL '1' DAY
+ORDER  BY log_id DESC;
+
+-- the lifecycle of one object: created, recreated, dropped, repaired, failed
+SELECT log_time, run_id, phase, event, status, detail
+FROM   EXT_SYNC_LOG_V1
+WHERE  object_name = 'CUSTOMERS' OR source_table LIKE '%.customers'
+ORDER  BY log_id;
+
+-- which run dropped it, and why that run ran at all
+SELECT * FROM EXT_SYNC_LOG_V1
+WHERE  run_id = (SELECT MAX(run_id) FROM EXT_SYNC_LOG_V1 WHERE event = 'TABLE_DROPPED'
+                 AND object_name = 'CUSTOMERS')
+ORDER  BY log_id;
+```
+
+Retention is the operator's: `DELETE FROM EXT_SYNC_LOG_V1 WHERE log_time < SYSTIMESTAMP -
+INTERVAL '90' DAY;` on whatever schedule suits the fleet. The teardown cell removes the
+catalog's rows along with its other state.
+
 ## Troubleshooting
+
+Start any investigation with the execution log — one query returns the step-by-step story of
+the run (see [Execution log](#execution-log)):
+
+```sql
+SELECT log_time, phase, event, status, owner, object_name, source_table, detail
+FROM   EXT_SYNC_LOG_V1
+WHERE  run_id = :run_id            -- printed in the run banner and after each ADW's apply
+ORDER  BY log_id;
+```
 
 | Symptom | Cause |
 |---|---|
@@ -882,6 +977,8 @@ protections are in `ARCHITECTURE.md`, section 7.
 | `Configuration file not found` | scheduled job with the config not next to the notebook. Set `CONFIG_PATH` |
 | `CATALOG not provided` | the job parameter is missing or spelled differently. `CATALOG` and `catalog` both work |
 | `CROSS-CATALOG COLLISION` | another catalog already owns objects this job would create. Check the schema prefix |
+| `ORA-29913` / `KUP-13057` / `ORA-20404` on `.../metadata/version-hint.text` or a `snap-*.avro`, after a table was **renamed** | renaming a managed table moves its folder, and the Iceberg metadata (which records absolute paths) still references the previous location until regenerated. Set `flags.fix_renamed_uniform: true` for one run, or rename the table back, or recreate it under the new name with `CREATE TABLE <new> … AS SELECT * FROM <old>` (CTAS). See also the [Delta UniForm Metadata Doctor](../delta-uniform-metadata-doctor/README.md) for catalog-wide health checks |
+| `DROP guard tripped` after deleting source tables | the drop set exceeded `guards.max_drop_abs` / `guards.max_drop_frac`. Verify the drops are real, set `guards.allow_mass_drop: true` for one run, then set it back |
 | `ORA-00942` on a consumer query | the query started inside the ~0.8s drop-and-recreate window. Schedule syncs off-peak |
 | a consumer does not see a newly added column | misaligned metadata: the tip snapshot references an older schema. See "Handling a misaligned table" |
 | `ORA-01017` intermittently | two jobs with work in the same schema rotating the password under each other. Run catalogs sequentially |
@@ -909,6 +1006,10 @@ Full commented template in `adw_sync.example.yaml`.
 | `flags.force_snapshot` | `false` | realign misaligned tables. Writes to the source and adds significant run time; leave off unless needed |
 | `flags.retry_failed` | `true` | one retry before writing the registry |
 | `flags.bulk_discovery` | `true` | bulk listing through the OCI SDK |
+| `flags.fix_renamed_uniform` | `false` | regenerate the Iceberg metadata of tables that were **renamed** or moved (Iceberg metadata records absolute paths, so it references the previous folder until regenerated): metadata is moved to a timestamped backup under `_uniform_fix_bkp/` beside the table, one marker commit triggers a full regeneration, and the table is re-discovered into the same run. Writes to the source; enable for the run that repairs, then turn back off. Off, such tables are reported and excluded from the sync until repaired |
+| `guards.max_drop_abs` | `25` | DROP guard: refuse more than this many drops per run |
+| `guards.max_drop_frac` | `0.25` | DROP guard: ...or more than this fraction of the registered tables |
+| `guards.allow_mass_drop` | `false` | one-run override once the drops are verified as real; set back after use |
 | `parallelism.workers` | `8` | connections per ADW |
 | `parallelism.adw_workers_cap` | `4` | cap on ADWs in parallel |
 | `parallelism.intra_schema_workers` | `1` | slices per schema; raise when few schemas hold many tables |
@@ -918,6 +1019,7 @@ Full commented template in `adw_sync.example.yaml`.
 | `discovery.exclude_schemas` | see the example file | schemas never synced |
 | `registry_table` | `ADMIN.EXT_REGISTRY_V4` | sync state, catalog-scoped. Leave **unqualified** when `adw_user` is not `ADMIN` |
 | `credential_state_table` | `EXT_CRED_STATE_V1` | API key fingerprint per `(catalog, schema)`, used to detect a rotation. Same schema-qualifier rule as `registry_table` |
+| `log_table` | `EXT_SYNC_LOG_V1` | execution log, one row per relevant event of every apply run. Same schema-qualifier rule as `registry_table`; `null` disables. See [Execution log](#execution-log) |
 | `acl_privileges` | `[connect]` | network ACL privileges |
 | `vault_key` | `VaultSecretReference` | fixed literal for a Vault Reference |
 | `catalog` | `null` | interactive-testing fallback only; the banner warns when it is used |
