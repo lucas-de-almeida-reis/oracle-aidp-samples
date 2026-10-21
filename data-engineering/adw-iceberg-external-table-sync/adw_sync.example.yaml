@@ -126,6 +126,7 @@ guards:
   max_drop_abs: 25        # refuse more than this many drops per run, regardless of catalog size
   max_drop_frac: 0.25     # ...or more than this fraction of the registered tables
   allow_mass_drop: false  # one-run override after verifying the drops are real; set back after
+  max_fix_renamed: 20     # rename repairs per run (flags.fix_renamed_uniform); a larger set is refused
 
 # --- Parallelism ---
 # Connections per run = min(fleet size, adw_workers_cap) x workers

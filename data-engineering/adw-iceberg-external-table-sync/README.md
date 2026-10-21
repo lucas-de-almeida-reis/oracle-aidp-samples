@@ -909,7 +909,7 @@ Every **apply** run writes one row per relevant event into `log_table` (default
 | Phase | Event | When |
 |---|---|---|
 | `RUN` | `RUN_START` | per ADW: config path, connection mode, db user, flags, parallelism — names only, never credential values |
-| `RUN` | `RUN_END` | every exit, success or abort; `detail` carries the same summary dict the run prints, plus duration |
+| `RUN` | `RUN_END` | every completed apply and the two explicit aborts (DROP guard, cross-catalog collision); `detail` carries the same summary dict the run prints, plus duration. A run that crashes elsewhere (lost connection, DDL error) leaves a `RUN_START` with no `RUN_END` - the gap itself is the signal |
 | `DISCOVERY` | `SCHEMA_SCANNED` | per schema: tables found, with metadata, objects listed, requests |
 | `DISCOVERY` | `TABLE_ERROR` | a table discovery could not read — excluded and shielded from DROP |
 | `DISCOVERY` | `RENAMED_DETECTED` | Iceberg metadata references a previous folder (see the troubleshooting row on renames) |
@@ -918,7 +918,7 @@ Every **apply** run writes one row per relevant event into `log_table` (default
 | `PLAN` | `PLAN_BUILT` | totals, duration, and the storage layout discovery derived |
 | `FIX_RENAMED` | `METADATA_MOVED` / `REPAIRED` / `FIX_TIMEOUT` / `FIX_FAILED` / `FIX_SKIPPED_FLAG_OFF` | the rename repair, step by step, including the backup path |
 | `FORCE_SNAPSHOT` | `SNAPSHOT_ROLLED` / `SNAPSHOT_FAILED` | per realigned table |
-| `GUARD` | `GUARD_TRIPPED` | the DROP guard refused the run |
+| `GUARD` | `GUARD_TRIPPED` | the DROP guard refused the run, or the rename-repair cap (`guards.max_fix_renamed`) was exceeded |
 | `APPLY` | `CROSS_CATALOG_COLLISION` | the collision check refused the run |
 | `CREDENTIAL` | `CRED_REFRESHED` / `CRED_ERROR` | per schema whose DBMS_CLOUD credential was (re)installed |
 | `APPLY` | `TABLE_CREATED` / `TABLE_RECREATED` / `TABLE_DROPPED` | per action, with grants reapplied and whether a retry was needed |
@@ -1010,6 +1010,7 @@ Full commented template in `adw_sync.example.yaml`.
 | `guards.max_drop_abs` | `25` | DROP guard: refuse more than this many drops per run |
 | `guards.max_drop_frac` | `0.25` | DROP guard: ...or more than this fraction of the registered tables |
 | `guards.allow_mass_drop` | `false` | one-run override once the drops are verified as real; set back after use |
+| `guards.max_fix_renamed` | `20` | cap on `flags.fix_renamed_uniform` repairs per run; a larger set is reported, left untouched and shielded from DROP (a whole catalog looking renamed is a systemic event, not real renames) |
 | `parallelism.workers` | `8` | connections per ADW |
 | `parallelism.adw_workers_cap` | `4` | cap on ADWs in parallel |
 | `parallelism.intra_schema_workers` | `1` | slices per schema; raise when few schemas hold many tables |
