@@ -94,6 +94,18 @@ flags:
   # Writes to the SOURCE lakehouse and waits for asynchronous metadata regeneration - several
   # seconds per table - so it can dominate the run time. Recommended OFF; enable per run.
   force_snapshot: false
+  # Regenerates the Iceberg metadata of tables that were renamed or moved. Iceberg metadata
+  # records absolute paths, so after a managed-table rename (which moves the folder) the
+  # existing metadata still references the previous location and the ADW external table
+  # reports KUP-13057/ORA-20404 until the metadata is regenerated. The repair MOVES the
+  # table's metadata/ to a timestamped backup under _uniform_fix_bkp/ beside the table (a
+  # backup, never a delete), rolls one marker commit (insert + delete, data unchanged), waits
+  # for the fresh metadata, and re-discovers the table into the same run. Writes to the SOURCE
+  # lakehouse. Recommended OFF: enable it for the run that repairs, then turn it back off.
+  # While off, such tables are reported and excluded from the sync until repaired. Prefer not
+  # renaming UniForm tables at all - recreate them under the new name with
+  # CREATE TABLE <new> ... AS SELECT * FROM <old> (CTAS) instead.
+  fix_renamed_uniform: false
   retry_failed: true      # one retry before writing the registry
   bulk_discovery: true    # bulk listing through the Object Storage SDK
   # mTLS wallet, fleet-wide. Set false ONLY when every ADB has mutual TLS set to NOT
@@ -104,6 +116,17 @@ flags:
   # From AIDP, false needs a PRIVATE-endpoint ADB: on a public endpoint, turning mutual
   # TLS off requires an ACL, and an active ACL refuses AIDP (ORA-12529).
   use_wallet: true
+
+# --- DROP guard ---
+# Dropping an external table also drops its consumer grants, so an oversized DROP set - the
+# signature of a transient empty/partial discovery or a wrong catalog_name, NOT of real
+# deletions - is refused. Everything lives here: authorising a legitimate mass-drop never
+# requires editing the notebook.
+guards:
+  max_drop_abs: 25        # refuse more than this many drops per run, regardless of catalog size
+  max_drop_frac: 0.25     # ...or more than this fraction of the registered tables
+  allow_mass_drop: false  # one-run override after verifying the drops are real; set back after
+  max_fix_renamed: 20     # rename repairs per run (flags.fix_renamed_uniform); a larger set is refused
 
 # --- Parallelism ---
 # Connections per run = min(fleet size, adw_workers_cap) x workers
@@ -149,6 +172,16 @@ discovery:
 # defaults unqualified. Set both the same way for your deployment.
 registry_table: ADMIN.EXT_REGISTRY_V4
 credential_state_table: EXT_CRED_STATE_V1
+
+# Execution log: one row per relevant event of every APPLY run - discovery findings, rename
+# repairs, creates / recreates / drops, credential refreshes, guard trips, errors - written
+# inside each ADW so one query reconstructs any run. Same schema-qualifier rule as the two
+# tables above; the unqualified default resolves to each ADW's adw_user schema. One run_id
+# correlates a run's rows across the fleet, and the catalog-level events (discovery, plan,
+# repairs) are replicated into every ADW so each log is self-contained. Nothing is logged for
+# actions not taken; the dry run never writes. Set to null to disable. See README,
+# "Execution log".
+log_table: EXT_SYNC_LOG_V1
 
 acl_privileges:
   - connect
