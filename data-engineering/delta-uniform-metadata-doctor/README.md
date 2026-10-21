@@ -207,7 +207,9 @@ done.
   COLUMN`) is a different condition with a different fix (a data commit on the source) — it is
   the [ADW Iceberg External Table Sync](../adw-iceberg-external-table-sync/README.md)'s
   `MISALIGNED`/`force_snapshot` territory, and the doctor does not act on it.
-- Don't run two repair-mode doctors against the same catalog concurrently.
+- Don't run two repair-mode doctors against the same catalog concurrently, nor a repair-mode
+  doctor alongside the sync with `flags.fix_renamed_uniform: true` on that catalog: both move
+  the same `metadata/` folders.
 - Streaming/CDF consumers of a repaired table will see the marker row inserted and deleted
   (the data itself ends unchanged).
 - A rename of a managed UniForm table is, in effect, a folder move (the folder is derived
